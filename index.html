@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <!-- Local server: $ python3 -m http.server -->
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <script src="https://unpkg.com/typescript@5.9.3/lib/typescript.js"></script>
+    <script>
+      function run(tsCode) {
+        const js = ts.transpile(tsCode, {
+          module: ts.ModuleKind.CommonJS,
+          target: ts.ScriptTarget.ESNext,
+          removeComments: true,
+          inlineSourceMap: true,
+          inlineSources: true,
+        });
+        new Function("exports", js)({});
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        const scripts = document
+          .querySelectorAll('script[type="text/typescript"]')
+          .forEach((el) => {
+            if (el.hasAttribute("src")) {
+              fetch(el.src)
+                .then((r) => {
+                  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                  return r.text();
+                })
+                .then(run);
+            } else {
+              run(el.textContent);
+            }
+          });
+      });
+    </script>
+    <script type="text/typescript" src="main.ts"></script>
+
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap");
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-size: 16px;
+      }
+
+      canvas {
+        display: block;
+      }
+
+      .c,
+      .r {
+        display: flex;
+      }
+
+      .c {
+        flex-direction: column;
+      }
+
+      .r {
+        flex-direction: row;
+      }
+
+      #panel {
+        font-family: "Google Sans Code", monospace;
+        position: absolute;
+        top: 1rem;
+        left: 70%;
+        right: 1rem;
+        bottom: 1rem;
+        background-color: hsla(0, 0%, 100%, 0.5);
+        border-radius: 1rem;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 0 1px oklch(0.6 0.0248 264.71);
+        /*border: 1px solid oklch(0.92 0.0148 264.71);*/
+        padding: 1.5em 2rem;
+      }
+
+      header,
+      #tabs,
+      #cmds {
+        gap: 0.62em;
+      }
+
+      header {
+        flex-shrink: 0;
+        justify-content: space-between;
+      }
+      #tabs > div:hover {
+        color: black;
+        cursor: pointer;
+      }
+      #tabs > :not(.active) {
+        color: oklch(0.74 0.0148 264.71);
+      }
+      #tabs > .active {
+        color: black;
+        border-radius: 1em;
+        font-weight: bold;
+      }
+
+      #toggle,
+      #open-panel {
+        cursor: pointer;
+        opacity: 0.5;
+      }
+
+      #toggle:hover,
+      #open-panel:hover {
+        opacity: 1;
+      }
+
+      pre {
+        flex: 1;
+        outline: none;
+        overflow: auto;
+      }
+
+      #errors {
+        position: absolute;
+        bottom: 1rem;
+        color: red;
+        text-align: right;
+      }
+
+      ::highlight(parse-error) {
+        background: red;
+      }
+
+      /*::highlight(comment) {
+        color: oklch(0.73 0.0148 264.71);
+      }*/
+
+      #open-panel {
+        position: absolute;
+        top: 2.5em;
+        right: 3em;
+      }
+    </style>
+    <svg style="display: none">
+      <defs>
+        <symbol id="arrow-top-right" viewBox="0 0 32 32">
+          <g
+            transform="matrix(0.707107,0.707107,-0.766032,0.766032,23.365696,-2.679404)"
+          >
+            <path
+              d="M10,11.303L10,27.154C10,28.173 9.104,29 8,29C6.896,29 6,28.173 6,27.154L6,11.303L1.636,15.331C0.856,16.052 -0.411,16.052 -1.192,15.331C-1.973,14.611 -1.973,13.441 -1.192,12.72L6.586,5.54C6.967,5.189 7.475,5 8,5C8.525,5 9.033,5.189 9.414,5.54L17.192,12.72C17.973,13.441 17.973,14.611 17.192,15.331C16.411,16.052 15.144,16.052 14.364,15.331L10,11.303Z"
+            />
+          </g>
+        </symbol>
+        <symbol id="arrow-bottom-left" viewBox="0 0 32 32">
+          <g transform="rotate(180 16 16)">
+            <use href="#arrow-top-right"></use>
+          </g>
+        </symbol>
+      </defs>
+    </svg>
+  </head>
+  <body>
+    <div id="open-panel">
+      <svg width="16" height="16">
+        <use href="#arrow-bottom-left"></use>
+      </svg>
+    </div>
+    <canvas></canvas>
+    <div id="panel" class="c">
+      <div id="errors"></div>
+      <header class="r">
+        <div id="tabs" class="r"></div>
+        <div id="cmds" class="r">
+          <div id="toggle">
+            <svg width="16" height="16">
+              <use href="#arrow-top-right"></use>
+            </svg>
+          </div>
+        </div>
+      </header>
+      <pre contenteditable="plaintext-only"></pre>
+    </div>
+  </body>
+</html>
