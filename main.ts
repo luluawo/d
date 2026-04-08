@@ -860,9 +860,7 @@ class Lambda {
           e0 = l0.exp.findIndex((x) => x !== 0),
           e1 = l1.exp.findIndex((x) => x !== 0);
         if (
-          l0.label === 0 &&
-          l1.label === 0 &&
-          l0.combinator !== l1.combinator &&
+          l0.label === l1.label &&
           l0.exp[e0] < 0 &&
           l1.exp[e1] > 0 &&
           !status.has(l0) &&
