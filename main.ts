@@ -1650,7 +1650,7 @@ class Plot2 {
 
     this.context.textAlign = "center";
     for (let i = 0; i < this.paths.length; i++) {
-      this.context.fillText(i.toString(), ...grid(0, i + 1).array());
+      this.context.fillText((i + 1).toString(), ...grid(0, i + 1).array());
     }
 
     this.context.font = "12px sans-serif";
