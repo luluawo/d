@@ -1567,7 +1567,7 @@ class Plot2 {
   constructor(
     public readonly canvas: HTMLCanvasElement,
     public readonly paths: Path<Lift>[],
-    public readonly totalPaths: number,
+    public readonly totalPaths: [number, number],
     public readonly arities: Map<Combinator, number>,
   ) {
     this.context = canvas.getContext("2d")!;
@@ -1641,10 +1641,11 @@ class Plot2 {
     this.context.lineJoin = "round";
     this.context.textBaseline = "middle";
 
+    this.context.fillStyle = "black";
     this.context.font = "22px sans-serif";
     this.context.textAlign = "left";
     this.context.fillText(
-      `Showing ${this.paths.length} of ${this.totalPaths} paths (including acyclic symmetries)`,
+      `Showing ${this.paths.length} of ${this.totalPaths[0]} paths (${this.totalPaths[1]} excluding simple symmetries)`,
       ...grid(1, 0.38).array(),
     );
 
@@ -1932,10 +1933,14 @@ const TABS: { [key: string]: (code: string) => () => void } = {
   },
   path(code: string) {
     const lam = Lambda.parse(code);
+    let [cyclic, acyclic] = [0, 0];
+    for (const p of lam.nfa().paths()) {
+      p.cyclic ? cyclic++ : acyclic++;
+    }
     const plot = new Plot2(
       canvas,
       lam.paths().take(50).toArray(),
-      lam.nfa().paths().count(),
+      [cyclic + acyclic, cyclic + acyclic / 2],
       lam.arities(),
     );
     return () => {
