@@ -15,6 +15,7 @@
           inlineSourceMap: true,
           inlineSources: true,
         });
+        // document.body.textContent = js;
         new Function("exports", js)({});
       }
 
@@ -89,6 +90,9 @@
         flex-shrink: 0;
         justify-content: space-between;
       }
+      #tabs {
+        flex-wrap: wrap;
+      }
       #tabs > div:hover {
         color: black;
         cursor: pointer;
@@ -123,7 +127,7 @@
         position: absolute;
         bottom: 1rem;
         color: red;
-        text-align: right;
+        text-align: left;
       }
 
       ::highlight(parse-error) {

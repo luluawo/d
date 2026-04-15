@@ -1,5 +1,9 @@
 export {};
 
+type Tuple<T, N extends number, R extends T[] = []> = R["length"] extends N
+  ? R
+  : Tuple<T, N, [...R, T]>;
+
 type Token = {
   regex: RegExp;
   text: string;
@@ -33,7 +37,7 @@ declare global {
 
 Map.prototype.getOrInsert = function <K, V>(k: K, create: () => V) {
   let v = this.get(k);
-  if (!v) {
+  if (v === undefined) {
     this.set(k, (v = create()));
   }
   return v;
@@ -50,6 +54,7 @@ declare global {
     findIndex(predicate: (value: T) => boolean): number;
     windows(size: number): Generator<T[]>;
     count(): number;
+    enumerate(): Generator<[number, T]>;
   }
 }
 
@@ -120,8 +125,37 @@ Iterator.prototype.count = function <T>(): number {
   return count;
 };
 
+Iterator.prototype.enumerate = function* <T>(): Generator<[number, T]> {
+  let i = 0;
+  for (const x of this) {
+    yield [i++, x];
+  }
+};
+
 type Pin<T> = { value: T; inputs: Iterable<T>; outputs: Iterable<T> };
-type Path<T> = { sequence: T[]; cyclic: boolean };
+type Flatten<T> = T extends readonly (infer U)[] ? U : T;
+
+class Path<T> {
+  constructor(
+    public readonly sequence: T[],
+    public readonly cyclic: boolean,
+  ) {}
+
+  flat(): Path<Flatten<T>> {
+    return new Path(this.sequence.flat(), this.cyclic);
+  }
+
+  windows(size: number): IteratorObject<(T | undefined)[]> {
+    const pad = Array.from({ length: size - 1 }, () => undefined);
+    let it = this.cyclic
+      ? Iterator.concat(this.sequence, this.sequence).drop(
+          this.sequence.length - (size - 1),
+        )
+      : Iterator.concat(pad, this.sequence, pad);
+    return Iterator.from(it.windows(size));
+  }
+}
+
 type Editor<T> = {
   pin(x: T): Pin<T>;
   successors(x: T): Set<T>;
@@ -398,7 +432,25 @@ class Graph<T> {
 
   paths(): IteratorObject<Path<T>> {
     // Maximal paths
-    let visited = new Set<T>();
+
+    function canonical(sequence: readonly T[]): string {
+      // Equivalence by node set may not always be applicable but sufficient in this context (lifted in path space)
+      return sequence
+        .map((x) => JSON.stringify(x))
+        .sort()
+        .join("×");
+    }
+
+    function hasOrAdd<T>(set: Set<T>, key: T) {
+      if (set.has(key)) {
+        return true;
+      } else {
+        set.add(key);
+        return false;
+      }
+    }
+
+    let visited = new Set<string>();
     return this.terminals()
       .filter(({ source }) => source)
       .map(({ vertex }) => new Node(this, vertex))
@@ -408,16 +460,17 @@ class Graph<T> {
             start = path.findIndex((y, i) => i != path.length - 1 && x === y);
 
           if (start != -1) {
-            if (!visited.has(x)) {
-              let sequence = path.slice(start, -1);
-              sequence.forEach((y) => visited.add(y));
-              return [{ sequence, cyclic: true }];
+            const sequence = path.slice(start, -1);
+            if (!hasOrAdd(visited, canonical(sequence))) {
+              return [new Path(sequence, true)];
             } else {
               return [];
             }
           } else {
             return this.successors(x).size == 0
-              ? [{ sequence: path as T[], cyclic: false }]
+              ? !hasOrAdd(visited, canonical(path))
+                ? [new Path(path as T[], false)]
+                : []
               : xs.flatMap((x) => x);
           }
         }),
@@ -520,14 +573,28 @@ class Node<T> {
 type Syntax = { token?: Token; depth?: number };
 type Term = Syntax & { kind: "root" | "app" | "eq" | "lam" | "var" };
 type Brujin = Syntax & { kind: "app" | "lam" | "var" };
-type Combinator = Syntax & { kind: "node" | "port"; label: number };
-type Lift = { labels: number[]; combinator: Combinator };
-type Interaction = { pass: boolean };
+type Combinator = Syntax & {
+  id?: number;
+  kind: "node" | "port";
+  label: number;
+  arity?: number;
+};
+type Interaction = { product: 0 | 1 };
+type Lift = {
+  labels: number[];
+  combinator: Combinator;
+  interaction?: Interaction;
+}; // TODO remove this type and use tuples
+// type Lift = { sequence: Tuple<Combinator, 2>, interaction?: Interaction };
 
 class Lambda {
   private cache = new Map<string, any>();
 
-  constructor(public readonly ast: Node<Term>) {}
+  private constructor(ast?: Node<Term>) {
+    if (ast) {
+      this.cache.set("ast", ast);
+    }
+  }
 
   static atoms = {
     par: [/\(/, /\)/],
@@ -628,6 +695,10 @@ class Lambda {
     return new Lambda(term("root", undefined, roots).withDepth());
   }
 
+  get ast(): Node<Term> | undefined {
+    return this.cache.get("ast");
+  }
+
   brujin(): Node<Brujin> {
     return this.cache.getOrInsert("brujin", () => {
       let graph = new Graph<Brujin>();
@@ -644,79 +715,77 @@ class Lambda {
         return new Node(graph, obj, successors);
       }
 
-      let root = this.ast
-        .fold((path, iterator): Node<Brujin> | undefined => {
-          // DFS
-          let children = iterator
-            .filter((x) => x != undefined)
-            .map((x) => x.value)
-            .toArray();
+      let root = this.ast!.fold((path, iterator): Node<Brujin> | undefined => {
+        // DFS
+        let children = iterator
+          .filter((x) => x != undefined)
+          .map((x) => x.value)
+          .toArray();
 
-          let value = path.at(-1)!;
-          switch (value.kind) {
-            case "root":
-              let main = children.findLast((x) => x != undefined);
-              if (!main) {
-                throw new Error("missing main expression");
-              }
-              return new Node(graph, main);
-            case "app":
-              return BrujinNode(value, children);
-            case "eq":
-              if (path.length != 2) {
+        let value = path.at(-1)!;
+        switch (value.kind) {
+          case "root":
+            let main = children.findLast((x) => x != undefined);
+            if (!main) {
+              throw new Error("missing main expression");
+            }
+            return new Node(graph, main);
+          case "app":
+            return BrujinNode(value, children);
+          case "eq":
+            if (path.length != 2) {
+              throw new ParseError("unsupported nested equality", value.token!);
+            }
+            if (children.length != 2) {
+              throw new ParseError(
+                "unbalanced or misformatted equality",
+                value.token!,
+              );
+            }
+            if (children[0].kind != "var") {
+              throw new ParseError("invalid LHS", children[0].token!);
+            }
+            let node = new Node(graph, children[1]);
+            eqs.set(children[0].token!.text, node);
+            return node;
+          case "lam":
+            let lam = lams.get(value.token!);
+            lams.delete(value.token!);
+            vars.delete(value.token!.text);
+            if (children.length == 1) {
+              return lam
+                ? new Node(graph, lam, [children[0]]) // Do not clone
+                : BrujinNode(value, [children[0]]);
+            } else {
+              throw new ParseError("empty lambda body", value.token!);
+            }
+          case "var":
+            let name = value.token!.text;
+            if (path.at(-2)?.kind == "eq") {
+              return BrujinNode({ kind: "var", token: value.token }, []);
+            } else {
+              let lam = path.find(
+                (parent) => parent.kind == "lam" && parent.token!.text == name,
+              )?.token;
+              if (lam) {
+                let lamValue = lams.getOrInsert(lam, () => ({
+                  kind: "lam",
+                  token: lam,
+                }));
+                return vars.getOrInsert(name, () =>
+                  BrujinNode({ kind: "var", token: value.token }, [lamValue]),
+                );
+              } else if (eqs.has(name)) {
+                return eqs.get(name)!.clone();
+              } else {
                 throw new ParseError(
-                  "unsupported nested equality",
+                  "unknown variable (not implemented yet: global scope)",
                   value.token!,
                 );
               }
-              if (children.length != 2) {
-                throw new ParseError(
-                  "unbalanced or misformatted equality",
-                  value.token!,
-                );
-              }
-              if (children[0].kind != "var") {
-                throw new ParseError("invalid LHS", children[0].token!);
-              }
-              eqs.set(children[0].token!.text, new Node(graph, children[1]));
-              return undefined;
-            case "lam":
-              let lam = lams.get(value.token!);
-              lams.delete(value.token!);
-              vars.delete(value.token!.text);
-              if (children.length == 1) {
-                return lam
-                  ? new Node(graph, lam, [children[0]]) // Do not clone
-                  : BrujinNode(value, [children[0]]);
-              } else {
-                throw new ParseError("empty lambda body", value.token!);
-              }
-            case "var":
-              let name = value.token!.text;
-              if (path.at(-2)?.kind == "eq") {
-                return BrujinNode({ kind: "var", token: value.token }, []);
-              } else {
-                let lam = path.find(
-                  (parent) =>
-                    parent.kind == "lam" && parent.token!.text == name,
-                )?.token;
-                if (lam) {
-                  let lamValue = lams.getOrInsert(lam, () => ({
-                    kind: "lam",
-                    token: lam,
-                  }));
-                  return vars.getOrInsert(name, () =>
-                    BrujinNode({ kind: "var", token: value.token }, [lamValue]),
-                  );
-                } else if (eqs.has(name)) {
-                  return eqs.get(name)!.clone();
-                } else {
-                  throw new Error("not implemented yet: global scope");
-                }
-              }
-          }
-        })!
-        .withDepth();
+            }
+        }
+      })!.withDepth();
 
       return new Node(
         graph.filter((x) => x.depth !== undefined),
@@ -819,26 +888,16 @@ class Lambda {
       }
       go([root.value]);
 
+      let cid = 0;
       let g2 = g.undirected();
-
-      this.cache.set(
-        "arities",
-        new Map<Combinator, number>(
-          g2
-            .vertices()
-            .filter((x) => x.kind == "node")
-            .map((x) => [x, g2.successors(x).size - 1]),
-        ),
-      );
+      g2.vertices()
+        .filter((x) => x.kind == "node")
+        .forEach((x) => {
+          x.id = cid++;
+          x.arity = g2.successors(x).size - 1;
+        });
       return g2;
     });
-  }
-
-  arities(): Map<Combinator, number> {
-    if (!this.cache.has("arities")) {
-      this.inet();
-    }
-    return this.cache.get("arities");
   }
 
   nfa(): Graph<Combinator[]> {
@@ -894,95 +953,81 @@ class Lambda {
     });
   }
 
-  paths(): IteratorObject<Path<Lift>> {
-    const PAD = [undefined, undefined];
+  static lifted(cs: Tuple<Combinator | undefined, 3>): Lift | undefined {
+    const [x0, x1, x2] = cs;
+    if ((x0 === undefined || x2 === undefined) && x1?.kind === "node") {
+      return {
+        labels: [x0 === undefined ? 1 : -1, x1.label, 0],
+        combinator: x1,
+      };
+    } else if (x0 !== undefined && x2 !== undefined && x1?.kind === "node") {
+      return {
+        labels: [
+          x2.label == 0 ? 1 : -1,
+          x1.label,
+          Math.max(x0.label, x2.label) - 1,
+        ],
+        combinator: x1,
+      };
+    } else {
+      return undefined;
+    }
+  }
 
-    function convert(path: IteratorObject<Combinator | undefined>): Lift[] {
-      return path
+  paths(): IteratorObject<Path<Lift>> {
+    function convert(path: Path<Combinator | undefined>): Path<Lift> {
+      let sequence = path
         .windows(3)
-        .flatMap(([x0, x1, x2]) => {
-          if ((x0 === undefined || x2 === undefined) && x1?.kind === "node") {
-            return [
-              {
-                labels: [x0 === undefined ? 1 : -1, x1.label, 0],
-                combinator: x1,
-              },
-            ];
-          } else if (
-            x0 !== undefined &&
-            x2 !== undefined &&
-            x1?.kind === "node"
-          ) {
-            return [
-              {
-                labels: [
-                  x2.label == 0 ? 1 : -1,
-                  x1.label,
-                  Math.max(x0.label, x2.label) - 1,
-                ],
-                combinator: x1,
-              },
-            ];
-          }
-          return [];
-        })
+        .map((cs) => Lambda.lifted(cs as Tuple<Combinator, 3>))
+        .filter((l) => l !== undefined)
         .toArray();
+      return new Path(sequence, path.cyclic);
     }
 
     const nfa = this.nfa();
 
-    const cyclic = nfa
-      .paths()
-      .filter((p) => p.cyclic)
-      .map((p) => p.sequence.flatMap((x) => x))
-      .map((s) => ({
-        sequence: convert(Iterator.concat(s, s).drop(s.length - 2)),
-        cyclic: true,
-      }));
-    const acyclic = nfa
-      .paths()
-      .filter((p) => !p.cyclic)
-      .map((p) => p.sequence)
-      .map((s) => ({
-        sequence: convert(
-          Iterator.concat(
-            PAD,
-            s.values().flatMap((x) => x),
-            PAD,
-          ),
-        ),
-        cyclic: false,
-      }));
-
-    return Iterator.concat(cyclic, acyclic);
+    function getPaths(cyclic: boolean) {
+      return nfa
+        .paths()
+        .filter((p) => p.cyclic === cyclic)
+        .map((p) => convert(p.flat()));
+    }
+    return Iterator.concat(getPaths(true), getPaths(false));
   }
 
-  static interactions(path: Path<Lift>): Map<Lift, Interaction> {
-    let status = new Map<Lift, Interaction>();
-    let stack = [];
+  // TODO
+  // static interaction(l0: Lift, l1: Lift): { /* TODO */ } {}
 
-    for (const l1 of path.cyclic
-      ? Iterator.concat(path.sequence, path.sequence)
-      : path.sequence.values()) {
-      if (l1.labels[0] == 1) {
-        stack.push(l1);
-      } else {
-        let match = stack.findLastIndex(
-          (l0) => l0.labels[0] == 1 && l0.labels[1] == l1.labels[1],
-        );
-        if (match != -1) {
-          const l0 = stack.splice(match, 1)[0];
-          const interaction = { pass: l0.labels[2] === l1.labels[2] };
-          status.set(l0, interaction);
-          status.set(l1, interaction);
-          if (!interaction.pass) {
-            stack.splice(0, stack.length);
-          }
+  static pushInteraction(stack: Lift[], lift: Lift) {
+    if (lift.labels[0] == 1) {
+      stack.push(lift);
+    } else {
+      let match = stack.findLastIndex(
+        (l) => l.labels[0] == 1 && l.labels[1] == lift.labels[1],
+      );
+      if (match != -1) {
+        const left = stack.splice(match, 1)[0];
+        const interaction = {
+          product: Number(left.labels[2] === lift.labels[2]) as 0 | 1,
+        };
+        left.interaction = interaction;
+        lift.interaction = interaction;
+        if (!interaction.product) {
+          stack.splice(0, stack.length);
         }
       }
     }
+  }
 
-    return status;
+  static pushInteractions(path: Path<Lift>): Path<Lift> {
+    let stack: Lift[] = [];
+
+    for (const lift of path.cyclic
+      ? Iterator.concat(path.sequence, path.sequence)
+      : path.sequence.values()) {
+      Lambda.pushInteraction(stack, lift);
+    }
+    return path;
   }
 }
 
@@ -1007,6 +1052,9 @@ declare global {
     mul(v: Vector): this;
     div(v: Vector): this;
     dot(v: Vector): number;
+    abs(): this;
+    min(v: Vector): this;
+    max(v: Vector): this;
     norm(): number;
     normalize(): this;
     distance(to: Vector): number;
@@ -1062,6 +1110,24 @@ Float32Array.prototype.div = function (b: Vector): Float32Array {
 
 Float32Array.prototype.dot = function (b: Vector): number {
   return this[0] * b[0] + this[1] * b[1];
+};
+
+Float32Array.prototype.abs = function (): Float32Array {
+  this[0] = Math.abs(this[0]);
+  this[1] = Math.abs(this[1]);
+  return this;
+};
+
+Float32Array.prototype.min = function (b: Vector): Float32Array {
+  this[0] = Math.min(this[0], b[0]);
+  this[1] = Math.min(this[1], b[1]);
+  return this;
+};
+
+Float32Array.prototype.max = function (b: Vector): Float32Array {
+  this[0] = Math.max(this[0], b[0]);
+  this[1] = Math.max(this[1], b[1]);
+  return this;
 };
 
 Float32Array.prototype.norm = function (): number {
@@ -1150,15 +1216,15 @@ class Camera {
       wheel: () => void;
       resize: () => void;
     }> = {},
-    midpoint: Float32Array = DEFAULT_CONFIG.midpoint,
+    private readonly preserveTransformation: boolean = true,
+    private readonly midpoint: Float32Array = DEFAULT_CONFIG.midpoint,
   ) {
     this.context = this.canvas.getContext("2d")!;
 
-    if (Camera.transformation !== undefined) {
+    if (this.preserveTransformation && Camera.transformation !== undefined) {
       this.context.setTransform(Camera.transformation);
     } else {
-      const s = midpoint.slice().mul(Camera.window()).array();
-      this.context.setTransform(1, 0, 0, 1, ...s);
+      this.center();
     }
     this.listen();
     this.resize();
@@ -1166,6 +1232,45 @@ class Camera {
 
   static window(): Float32Array {
     return vec2(window.innerWidth, window.innerHeight);
+  }
+
+  get viewport() {
+    return vec2(this.canvas.width, this.canvas.height);
+  }
+
+  center() {
+    const s = this.midpoint.slice().mul(Camera.window()).array();
+    this.context.setTransform(1, 0, 0, 1, ...s);
+  }
+
+  fit(points: Iterable<Float32Array>, padding: number = 0) {
+    const ε = 10 ** -5;
+    const [min, max] = Iterator.from(points).reduce(
+      ([mi, ma], b) => [mi.min(b), ma.max(b)],
+      [vec2(), vec2()],
+    );
+    if (min.distance(max) < ε) {
+      this.center();
+      return;
+    } else {
+      const size = max.slice().sub(min);
+      const scales = this.viewport.sub(vec2(padding / 2)).div(size);
+      const scale = vec2(Math.min(scales[0], scales[1]));
+      const offset = this.viewport
+        .sub(size.mul(scale))
+        .mul(vec2(1 / 2))
+        .sub(min.mul(scale));
+      this.context.setTransform(
+        DOMMatrix.fromMatrix({
+          a: scale[0],
+          b: 0,
+          c: 0,
+          d: scale[1],
+          e: offset[0],
+          f: offset[1],
+        }),
+      );
+    }
   }
 
   listen() {
@@ -1213,7 +1318,7 @@ class Camera {
       (event) => {
         event.preventDefault();
         const p = this.toWorld(vec2(event.offsetX, event.offsetY));
-        const factor = 1 + event.deltaY * -0.001;
+        const factor = Math.max(0.001, 1 + event.deltaY * -0.001);
         this.context.transform(
           factor,
           0,
@@ -1263,7 +1368,9 @@ class Camera {
 
   destroy() {
     this.clear();
-    Camera.transformation = this.context.getTransform();
+    if (this.preserveTransformation) {
+      Camera.transformation = this.context.getTransform();
+    }
     this.controller.abort();
   }
 }
@@ -1285,7 +1392,7 @@ class Plot {
     public readonly graph: Graph<PlotT>,
     config: Partial<Config> = {},
   ) {
-    this.config = Object.assign({}, DEFAULT_CONFIG, config);
+    this.config = { ...DEFAULT_CONFIG, ...config };
     this.context = canvas.getContext("2d")!;
 
     let id = 0;
@@ -1333,8 +1440,10 @@ class Plot {
         wheel: () => this.dirty(),
         resize: () => this.dirty(),
       },
+      true,
       this.config.midpoint,
     );
+
     this.draw();
   }
 
@@ -1430,35 +1539,35 @@ class Plot {
     }
   }
 
-  simulate() {
-    // TODO planarity heuristics, pseudo-centrifugal force, adjust relative to CoM
-    function spring(
-      a: Float32Array,
-      b: Float32Array,
-      w = 0.005,
-      p = 3.0,
-      h = 500.0,
-    ) {
-      let dp = b.slice().sub(a);
-      let d = dp.norm() - h;
-      let k = clamp(Math.sign(d) * (w * Math.abs(d)) ** p, -20, 20);
-      return dp.normalize().mul(vec2(k));
-    }
-    for (const [a, b] of this.data.edges) {
-      let s = spring(a.p, b.p, 0.01, 3, 0);
-      a.p.add(s);
-      b.p.sub(s);
-    }
-    for (const [a, b] of this.graph.pairs()) {
-      if (a.id! < b.id!) {
-        let s = spring(a.p, b.p, 0.01, 2).clamp(vec2(-0.01), vec2(Infinity));
-        a.p.add(s);
-        b.p.sub(s);
-      }
-    }
-  }
+  // simulate() {
+  //   // must improve planarity heuristics, pseudo-centrifugal force, adjust relative to CoM
+  //   function spring(
+  //     a: Float32Array,
+  //     b: Float32Array,
+  //     w = 0.005,
+  //     p = 3.0,
+  //     h = 500.0,
+  //   ) {
+  //     let dp = b.slice().sub(a);
+  //     let d = dp.norm() - h;
+  //     let k = clamp(Math.sign(d) * (w * Math.abs(d)) ** p, -20, 20);
+  //     return dp.normalize().mul(vec2(k));
+  //   }
+  //   for (const [a, b] of this.data.edges) {
+  //     let s = spring(a.p, b.p, 0.01, 3, 0);
+  //     a.p.add(s);
+  //     b.p.sub(s);
+  //   }
+  //   for (const [a, b] of this.graph.pairs()) {
+  //     if (a.id! < b.id!) {
+  //       let s = spring(a.p, b.p, 0.01, 2).clamp(vec2(-0.01), vec2(Infinity));
+  //       a.p.add(s);
+  //       b.p.sub(s);
+  //     }
+  //   }
+  // }
 
-  simulate2() {
+  simulate() {
     // Grok
 
     // if (this.frames >= this.maxPhysicsFrames) return;
@@ -1542,7 +1651,12 @@ class Plot {
       const MAX_PHYSICS_TIME = 1000 / 60 / 2;
       const t0 = Date.now();
       for (let i = 0; i < 16 && Date.now() - t0 < MAX_PHYSICS_TIME; ++i)
-        this.simulate2();
+        this.simulate();
+
+      // if (this.frames < 60 && this.camera.pointer == undefined) {
+      //   this.camera.fit(this.data.vertices.values().map((v) => v.p));
+      // }
+
       this.draw();
       this.animationId = window.requestAnimationFrame(frame.bind(this));
     };
@@ -1558,35 +1672,285 @@ class Plot {
   }
 }
 
+type Bind = {
+  doodle: Doodle;
+  port: number;
+  out?: Bind;
+  control?: Float32Array[];
+};
+
+class Doodle {
+  static colors: Map<Interaction, string> = new Map();
+  static count: number = 0;
+  static DASHED = [4, 4];
+
+  private readonly id: number = Doodle.count++;
+  public lifts: Lift[] = [];
+  private binds: (Bind | undefined)[];
+  public data: any = undefined;
+  public style: {
+    text: string;
+    color: string;
+    dash: number[];
+    fill: boolean;
+  } = { text: "", color: "black", dash: [], fill: false };
+
+  constructor(
+    public readonly center: Float32Array,
+    public readonly shape: Float32Array[] | number,
+    public readonly ports: Float32Array[],
+    style: Partial<typeof this.style> = {},
+  ) {
+    this.binds = ports.map((_) => undefined);
+    this.style = { ...this.style, ...style };
+  }
+
+  static getInteractionColor(interaction: Interaction | undefined): string {
+    return interaction
+      ? Doodle.colors.getOrInsert(
+          interaction,
+          () =>
+            `oklch(65% 0.18 ${interaction.product ? (Math.random() * 360).toFixed(6) : 0})`,
+        )
+      : "black";
+  }
+  static equilateralTriangle(
+    center: Float32Array,
+    h: number,
+    angle: number,
+  ): Float32Array[] {
+    return [0, (2 * Math.PI) / 3, (4 * Math.PI) / 3].map((dt) =>
+      Float32Array.polar(h, angle + dt).add(center),
+    );
+  }
+  static axisCubic(
+    ctx: CanvasRenderingContext2D,
+    ps: Tuple<Float32Array, 2>,
+    squareness: number = 1,
+  ) {
+    const [p0, p1] = ps;
+    const xMid = (p0[0] + p1[0]) / 2;
+    ctx.beginPath();
+    ctx.moveTo(p0[0], p0[1]);
+    ctx.bezierCurveTo(
+      p0[0] + (xMid - p0[0]) * squareness,
+      p0[1],
+      p1[0] - (p1[0] - xMid) * squareness,
+      p1[1],
+      p1[0],
+      p1[1],
+    );
+  }
+  static polygon(ctx: CanvasRenderingContext2D, ps: Float32Array[]) {
+    ctx.beginPath();
+    ctx.moveTo(ps[0][0], ps[0][1]);
+    for (let i = 1; i < ps.length; i++) {
+      ctx.lineTo(ps[i][0], ps[i][1]);
+    }
+    ctx.closePath();
+  }
+
+  static from(
+    combinator: Combinator,
+    center: Float32Array,
+    radius: number,
+    clockwise: boolean,
+  ): Doodle {
+    let triangle = Doodle.equilateralTriangle(
+      center,
+      radius,
+      clockwise ? 0 : Math.PI,
+    );
+    if (clockwise) {
+      triangle = [triangle[0], triangle[2], triangle[1]];
+    }
+    const arity = combinator.arity!;
+
+    const spaceAround = 0.25;
+    const ports = Array.from({ length: arity }, (_, i) =>
+      triangle[1]
+        .slice()
+        .lerp(triangle[2], (i + spaceAround) / (arity - 1 + 2 * spaceAround)),
+    );
+    ports.unshift(triangle[0].slice());
+
+    const text =
+      combinator.label == 0
+        ? combinator.token
+          ? "λ" + combinator.token.text
+          : "@"
+        : combinator.label > 0
+          ? "#" + combinator.token!.text
+          : "⦻";
+
+    return new Doodle(center, arity > 0 ? triangle : radius, ports, { text });
+  }
+
+  static fromLift(lift: Lift, radius: number, center: Float32Array): Doodle {
+    let d = Doodle.from(lift.combinator, center, radius, lift.labels[0] > 0);
+    d.style = {
+      ...d.style,
+      color: Doodle.getInteractionColor(lift.interaction),
+      dash: lift.labels[1] != 0 ? Doodle.DASHED : [],
+      fill: lift.interaction !== undefined && !lift.interaction.product,
+    };
+    d.data = { lift };
+    return d;
+  }
+
+  static bind(b0: Bind, b1: Bind) {
+    b0.out = b1;
+    b1.out = b0;
+    b0.doodle.binds[b0.port] = b1;
+    b1.doodle.binds[b1.port] = b0;
+  }
+
+  static netFromLiftedPath(
+    path: Path<Lift>,
+    radius: number,
+    place: (i: number) => Float32Array,
+    controlPoints: (b0: Bind, b1: Bind) => Float32Array[] | undefined = () =>
+      undefined,
+  ): Doodle[] {
+    let p2 = new Path(
+      path.sequence.map((l, i) => Doodle.fromLift(l, radius, place(i))),
+      path.cyclic,
+    );
+    if (path.cyclic) {
+      for (const [i, d] of p2.sequence.entries()) {
+        d.data.boundary = i == 0 ? -1 : i == p2.sequence.length - 1 ? 1 : 0;
+      }
+    }
+    for (const [d0, d1] of p2.windows(2)) {
+      if (d0 !== undefined && d1 !== undefined) {
+        let bs = [d0, d1].map((d, last) => {
+          let l = d.data!.lift.labels;
+          return {
+            doodle: d,
+            port: l[0] > 0 === !last ? 0 : l[2] + 1,
+          };
+        }) as Bind[];
+        Doodle.bind(bs[0], bs[1]);
+        let cp = controlPoints(bs[0], bs[1]);
+        if (cp) {
+          bs[0].control = cp.slice(0, 3);
+          bs[1].control = cp.slice(3);
+        }
+      }
+    }
+    return p2.sequence;
+  }
+
+  static drawNet(context: CanvasRenderingContext2D, doodles: Doodle[]) {
+    context.font = "12px sans-serif";
+    context.lineWidth = 2;
+    context.lineJoin = "round";
+    context.lineCap = "round";
+    context.textBaseline = "middle";
+    context.textAlign = "center";
+    context.strokeStyle = "black";
+    context.setLineDash([]);
+
+    for (const d1 of doodles) {
+      for (const b of d1.binds) {
+        if (b !== undefined) {
+          const d0 = b!.doodle;
+          if (d0.id < d1.id) {
+            if (d0.style.color == d1.style.color) {
+              context.strokeStyle = d1.style.color;
+            } else {
+              context.strokeStyle = "black";
+            }
+            let p0 = d0.ports[b.port],
+              p1 = d1.ports[b.out!.port];
+            if (b.control === undefined || b.out!.control === undefined) {
+              Doodle.axisCubic(context, [p1, p0]);
+              context.stroke();
+            } else {
+              const doSomething = (cs: Float32Array[]) =>
+                context.bezierCurveTo(
+                  ...(cs
+                    .values()
+                    .flatMap((x) => x.values())
+                    .toArray() as Tuple<number, 6>),
+                );
+              context.beginPath();
+              context.moveTo(p0[0], p0[1]);
+              doSomething(b.control!);
+              if (!b.out!.control) {
+                console.log(b);
+              }
+              let c2 = b.out!.control!.toReversed();
+              context.lineTo(c2[0][0], c2[0][1]);
+              doSomething([...c2.values().drop(1), p1]);
+              context.stroke();
+            }
+          }
+        }
+      }
+    }
+
+    for (const d of doodles) {
+      d.draw(context);
+    }
+  }
+
+  private draw(context: CanvasRenderingContext2D) {
+    context.fillStyle = this.style.color;
+    context.strokeStyle = this.style.color;
+    context.setLineDash(this.style.dash);
+    if (typeof this.shape !== "number") {
+      Doodle.polygon(context, this.shape);
+    } else {
+      context.beginPath();
+      context.arc(this.center[0], this.center[1], this.shape, 0, 2 * Math.PI);
+    }
+    if (this.style.fill) {
+      context.fill();
+    } else {
+      context.stroke();
+    }
+    if (this.style.fill) {
+      context.fillStyle = "white";
+    }
+    context.fillText(this.style.text, this.center[0], this.center[1]);
+
+    const tip = 4;
+    for (const p of this.ports.filter((_, i) => this.binds[i] === undefined)) {
+      let p2 = p.slice().add(vec2(tip * (this.center[0] > p[0] ? -1 : 1), 0));
+      context.beginPath();
+      context.moveTo(p[0], p[1]);
+      context.lineTo(p2[0], p2[1]);
+      context.stroke();
+    }
+  }
+}
+
 class Plot2 {
+  static DIV = vec2(70, 100);
+  static PAD = vec2(1, 0);
+  static RADIUS = Plot2.DIV[0] / 2.5;
+
+  static grid(x: number, y: number) {
+    return vec2(x, y).add(Plot2.PAD).mul(Plot2.DIV);
+  }
+
   private context: CanvasRenderingContext2D;
   private camera: Camera;
-  private interactions: Map<Lift, Interaction>[];
-  private colors: Map<Interaction, string>[];
+  private doodles: Doodle[][];
 
   constructor(
     public readonly canvas: HTMLCanvasElement,
     public readonly paths: Path<Lift>[],
-    public readonly totalPaths: [number, number],
-    public readonly arities: Map<Combinator, number>,
+    public readonly totalPaths: {
+      high: number;
+      low: number;
+      cyclic: number;
+      acyclic: number;
+    },
   ) {
     this.context = canvas.getContext("2d")!;
-    this.interactions = paths.map((path) => Lambda.interactions(path));
-    this.colors = this.interactions.map(
-      (map) =>
-        new Map<Interaction, string>(
-          map
-            .values()
-            .map((int) => [
-              int,
-              int.pass
-                ? `oklch(65% 0.18 ${(Math.random() * 360).toFixed(6)})`
-                : "red",
-            ]),
-        ),
-    );
 
-    Camera.transformation = undefined;
     this.camera = new Camera(
       canvas,
       {
@@ -1597,173 +1961,214 @@ class Plot2 {
         resize: () => this.draw(),
         wheel: () => this.draw(),
       },
+      false,
       vec2(),
+    );
+
+    const makeControlPoints = (
+      b: Bind,
+      sign: number,
+    ): Tuple<Float32Array, 3> => {
+      const dx = 30;
+      const bottom = b.doodle.center[1] + Plot2.DIV[1] / 2.5;
+      let active = b.doodle.ports[b.port];
+      return [
+        vec2(sign * dx, 0).add(active),
+        vec2(active[0] + dx * sign, bottom),
+        vec2(active[0], bottom),
+      ];
+    };
+
+    this.doodles = this.paths.map((p, row) =>
+      Doodle.netFromLiftedPath(
+        p,
+        Plot2.RADIUS,
+        (col) => Plot2.grid(col + 1, row + 1),
+        (b0, b1) =>
+          p.cyclic &&
+          b0.doodle.data.boundary === -b1.doodle.data.boundary &&
+          b0.doodle.data.boundary !== 0
+            ? [
+                ...makeControlPoints(b0, b0.doodle.data.boundary),
+                ...makeControlPoints(b1, b1.doodle.data.boundary),
+              ]
+            : undefined,
+      ),
     );
 
     this.draw();
   }
 
   draw() {
-    function equilateralTriangle(
-      center: Float32Array,
-      h: number,
-      angle: number,
-    ): Float32Array[] {
-      return [0, (2 * Math.PI) / 3, (4 * Math.PI) / 3].map((dt) =>
-        Float32Array.polar(h, angle + dt).add(center),
-      );
-    }
-    function axisCubic(
-      ctx: CanvasRenderingContext2D,
-      ps: [Float32Array, Float32Array],
-    ) {
-      let xMid = (ps[0][0] + ps[1][0]) / 2;
-      ctx.beginPath();
-      ctx.moveTo(ps[0][0], ps[0][1]);
-      ctx.bezierCurveTo(xMid, ps[0][1], xMid, ps[1][1], ps[1][0], ps[1][1]);
-    }
-    function polygon(ctx: CanvasRenderingContext2D, ps: Float32Array[]) {
-      ctx.beginPath();
-      ctx.moveTo(ps[0][0], ps[0][1]);
-      for (let i = 1; i < ps.length; i++) {
-        ctx.lineTo(ps[i][0], ps[i][1]);
-      }
-      ctx.closePath();
-    }
     this.camera.clear();
-
-    const X_DIV = 70;
-    const Y_DIV = 100;
-    const Y_PAD = 0;
-    const grid = (x: number, y: number) =>
-      vec2((x + 1) * X_DIV, (y + Y_PAD) * Y_DIV);
-    this.context.lineWidth = 2;
-    this.context.lineJoin = "round";
-    this.context.textBaseline = "middle";
 
     this.context.fillStyle = "black";
     this.context.font = "22px sans-serif";
     this.context.textAlign = "left";
+    this.context.textBaseline = "middle";
     this.context.fillText(
-      `Showing ${this.paths.length} of ${this.totalPaths[0]} paths (${this.totalPaths[1]} excluding simple symmetries)`,
-      ...grid(1, 0.38).array(),
+      `Showing ${this.paths.length} of ${this.totalPaths.high} elementary paths (${this.totalPaths.low} excluding simple symmetries, ${this.totalPaths.cyclic} cyclic and ${this.totalPaths.acyclic} acyclic)`,
+      ...Plot2.grid(0.5, 0.35).array(),
     );
 
     this.context.textAlign = "center";
     for (let i = 0; i < this.paths.length; i++) {
-      this.context.fillText((i + 1).toString(), ...grid(0, i + 1).array());
+      this.context.fillText(
+        (i + 1).toString(),
+        ...Plot2.grid(0, i + 1).array(),
+      );
     }
 
-    this.context.font = "12px sans-serif";
-    for (const [i, { sequence, cyclic }] of this.paths.entries()) {
-      type Doodle = {
-        activePorts: Float32Array[];
-        inactivePorts: Float32Array[];
-        t: Float32Array[];
-        center: Float32Array;
-        text: string;
-        dash: number[];
-        style: string;
-      };
-
-      const interactions = this.interactions[i];
-      const colors = this.colors[i];
-      const ds: Doodle[] = sequence.map((lift, j) => {
-        const l = lift.labels;
-        const combinator = lift.combinator;
-        const clockwise = l[0] > 0;
-        const center = grid(j + 1, i + 1);
-        let t = equilateralTriangle(
-          center,
-          X_DIV / 2.5,
-          clockwise ? 0 : Math.PI,
-        );
-        if (clockwise) {
-          t = [t[0], t[2], t[1]];
-        }
-        const arity = this.arities.get(combinator)!;
-        const spaceAround = 0.25;
-        let ports = Array.from({ length: arity }, (_, i) =>
-          t[1]
-            .slice()
-            .lerp(t[2], (i + spaceAround) / (arity - 1 + 2 * spaceAround)),
-        );
-        let active = [t[0], ports.splice(l[2], 1)[0]];
-        return {
-          activePorts: clockwise ? active.reverse() : active,
-          inactivePorts: ports,
-          center,
-          t,
-          text:
-            l[1] == 0
-              ? combinator.token
-                ? "λ" + combinator.token.text
-                : "@"
-              : l[1] > 0
-                ? "#" + combinator.token!.text
-                : "⦻",
-          dash: l[1] != 0 ? [3, 3] : [],
-          style: !interactions.has(lift)
-            ? "black"
-            : colors.get(interactions.get(lift)!)!,
-        };
-      });
-      this.context.strokeStyle = "black";
-      ds.values()
-        .windows(2)
-        .map(([d0, d1]) => [d0.activePorts[1], d1.activePorts[0]])
-        .filter(([p0, p1]) => p0 && p1)
-        .forEach((ps) => {
-          axisCubic(this.context, ps as [Float32Array, Float32Array]);
-          this.context.stroke();
-        });
-      for (const d of ds) {
-        this.context.fillStyle = d.style;
-        this.context.strokeStyle = d.style;
-        this.context.setLineDash(d.dash);
-        polygon(this.context, d.t);
-        this.context.stroke();
-        this.context.setLineDash([]);
-        this.context.fillText(d.text, d.center[0], d.center[1]);
-        this.context.lineCap = "round";
-        for (const p of d.inactivePorts) {
-          let p2 = vec2(p[0] + 4 * (d.center[0] > p[0] ? -1 : 1), p[1]);
-          this.context.beginPath();
-          this.context.moveTo(p[0], p[1]);
-          this.context.lineTo(p2[0], p2[1]);
-          this.context.stroke();
-        }
-        this.context.lineCap = "butt";
-      }
-
-      if (cyclic) {
-        this.context.strokeStyle = "black";
-        let c0 = ds[0].activePorts[0],
-          c1 = ds.at(-1)!.activePorts[1];
-        this.context.beginPath();
-        this.context.moveTo(c0[0], c0[1]);
-        const dy = 30,
-          bottom = ds[0].center[1] + Y_DIV / 2.5;
-        this.context.bezierCurveTo(
-          c0[0] - dy,
-          c0[1],
-          c0[0] - dy,
-          bottom,
-          c0[0],
-          bottom,
-        );
-        this.context.lineTo(c1[0], bottom);
-        this.context.bezierCurveTo(
-          c1[0] + dy,
-          bottom,
-          c1[0] + dy,
-          c1[1],
-          c1[0],
-          c1[1],
-        );
-        this.context.stroke();
-      }
+    for (const net of this.doodles) {
+      Doodle.drawNet(this.context, net);
     }
+  }
+
+  destroy() {
+    this.camera.destroy();
+  }
+}
+
+class Plot3 {
+  private context: CanvasRenderingContext2D;
+  private camera: Camera;
+  private readonly doodles: Doodle[];
+
+  static grid(x: number, y: number) {
+    return vec2(x, y).mul(Plot2.DIV);
+  }
+
+  constructor(
+    public readonly canvas: HTMLCanvasElement,
+    public readonly reference: Node<Combinator[]>,
+  ) {
+    this.context = canvas.getContext("2d")!;
+
+    this.camera = new Camera(canvas, {
+      pointermove: () => {
+        this.draw();
+        return false;
+      },
+      resize: () => this.draw(),
+      wheel: () => this.draw(),
+    });
+
+    this.doodles = [];
+    const g = reference.graph;
+    const go = (
+      node: Combinator[],
+      i: number = 0,
+      p: Float32Array = vec2(),
+      previous: Tuple<Combinator | undefined, 3> = [
+        undefined,
+        undefined,
+        undefined,
+      ],
+      bind?: Partial<Bind>,
+      stack: Lift[] = [],
+      hits: number = 0,
+    ): number => {
+      const maxDim = 100 * (1 / (1 + hits));
+      if (hits >= 2 || Math.abs(p[0]) > maxDim || Math.abs(p[1]) > maxDim) {
+        return 0;
+      } else if (i >= node.length) {
+        let rows = 0;
+        const ss = [...g.successors(node)];
+
+        if (p[1] == 0 && ss.length > 2) {
+          throw new Error("unexpected"); // TODO impossible in this context but possible in custom nets
+        }
+        for (const [j, s] of ss.values().enumerate()) {
+          const dy =
+            ss.length == 1
+              ? 0
+              : p[1] == 0
+                ? j == 0
+                  ? -0.5
+                  : 0.5
+                : Math.sign(p[1]) * rows;
+          rows += go(
+            s,
+            0,
+            vec2(0, dy).add(p),
+            previous,
+            bind,
+            stack.slice(),
+            hits,
+          );
+        }
+        return Math.max(1, rows);
+      } else {
+        const c = node[i];
+        const previous2: Tuple<Combinator | undefined, 3> = [
+          previous[1],
+          previous[2],
+          c,
+        ];
+        const lift = Lambda.lifted(previous2);
+        if (lift !== undefined) {
+          Lambda.pushInteraction(stack, lift);
+          bind!.doodle!.lifts.push(lift);
+          if (lift.interaction && !lift.interaction.product) {
+            hits++;
+          }
+        }
+        if (node[i].kind === "node") {
+          const enter = previous.at(-1);
+          const clockwise = enter === undefined || enter.label > 0;
+          let d = Doodle.from(
+            c,
+            Plot3.grid(p[0], p[1]),
+            Plot2.RADIUS,
+            clockwise,
+          );
+          if (bind !== undefined) {
+            Doodle.bind(bind as Bind, { doodle: d, port: enter!.label });
+          }
+          if (c.label !== 0) {
+            d.style.dash = Doodle.DASHED;
+          }
+          d.style.color = hits === 0 ? "black" : "gray";
+          this.doodles.push(d);
+          return go(
+            node,
+            i + 1,
+            vec2(1, 0).add(p),
+            previous2,
+            { doodle: d },
+            stack,
+            hits,
+          );
+        } else {
+          if (bind !== undefined && bind.port === undefined) {
+            bind = { ...bind, port: c.label };
+          }
+          return go(node, i + 1, p, previous2, bind, stack, hits);
+        }
+      }
+    };
+    go(reference.value);
+
+    this.camera.fit(
+      this.doodles
+        .values()
+        .flatMap((d) =>
+          Array.isArray(d.shape)
+            ? d.shape
+            : [
+                d.center.slice().add(vec2(d.shape)),
+                d.center.slice().sub(vec2(d.shape)),
+              ],
+        ),
+      200,
+    );
+
+    this.draw();
+  }
+
+  draw() {
+    this.camera.clear();
+    Doodle.drawNet(this.context, this.doodles);
   }
 
   destroy() {
@@ -1773,21 +2178,22 @@ class Plot2 {
 }
 
 const EXAMPLES = {
-  addition: `0 = λf x. x
+  test0: `(λn. (λf. (λx. (f ((n f) x)))))`,
+  "λ minimum cyclical (Identity)": `I = (λx. x)(λx. x)`,
+  "λ minimum nonhalting (Ω)": `Ω = (λx. x x)(λx. x x)`,
+  "λ minimum diverging": `Ω3 = (λx. x x x)(λx. x x x)`,
+  "λ fixed-point (Y)": `Y = λf. (λx. f (x x)) (λx. f (x x))`,
+  "λ addition": `0 = λf x. x
 S = λn f x. f (n f x)
 
 1 = S 0
 2 = S 1
 3 = S 2
 
-add = λn m f x. n f (m f x)
-# add = λx. x S
+add = λx. x S
+# add = λn m f x. n f (m f x)
 
 add 1 2`,
-  test0: `(λn. (λf. (λx. (f ((n f) x)))))`,
-  test1: `λx. x x`,
-  test2: `λf. λx. x`,
-  Y: `λf. (λx. f (x x)) (λx. f (x x))`,
 };
 
 const tabs = document.querySelector("#tabs")!;
@@ -1874,14 +2280,12 @@ function _simplePlot(root: Node<Term> | Node<Brujin>): () => void {
     place(root, (x) => [Formats.syntax(x), "↓" + x.depth]),
   );
   plot.anime();
-  return () => {
-    plot.destroy();
-  };
+  return () => plot.destroy();
 }
 
 const TABS: { [key: string]: (code: string) => () => void } = {
   ast(code: string) {
-    return _simplePlot(Lambda.parse(code).ast);
+    return _simplePlot(Lambda.parse(code).ast!);
   },
   brujin(code: string) {
     return _simplePlot(Lambda.parse(code).brujin());
@@ -1905,9 +2309,7 @@ const TABS: { [key: string]: (code: string) => () => void } = {
       { arrows: false },
     );
     plot.anime();
-    return () => {
-      plot.destroy();
-    };
+    return () => plot.destroy();
   },
   nfa(code: string) {
     const g: Graph<Combinator[]> = Lambda.parse(code).nfa();
@@ -1927,9 +2329,7 @@ const TABS: { [key: string]: (code: string) => () => void } = {
       ]),
     );
     plot.anime();
-    return () => {
-      plot.destroy();
-    };
+    return () => plot.destroy();
   },
   path(code: string) {
     const lam = Lambda.parse(code);
@@ -1939,13 +2339,31 @@ const TABS: { [key: string]: (code: string) => () => void } = {
     }
     const plot = new Plot2(
       canvas,
-      lam.paths().take(50).toArray(),
-      [cyclic + acyclic, cyclic + acyclic / 2],
-      lam.arities(),
+      lam.paths().take(50).map(Lambda.pushInteractions).toArray(),
+      {
+        high: cyclic + acyclic,
+        low: cyclic + acyclic / 2,
+        cyclic,
+        acyclic: acyclic / 2,
+      },
     );
-    return () => {
-      plot.destroy();
-    };
+    return () => plot.destroy();
+  },
+  unfold: (code: string) => {
+    const g = Lambda.parse(code).nfa();
+    const outputEraser = g
+      .vertices()
+      .reduce((x, y) =>
+        x[0].label < 0
+          ? y[0].label < 0
+            ? x[0].depth! < y[0].depth!
+              ? x
+              : y
+            : x
+          : y,
+      );
+    const plot = new Plot3(canvas, new Node(g, outputEraser));
+    return () => plot.destroy();
   },
 };
 
@@ -1954,7 +2372,7 @@ const STORAGE_ITEM = "state";
 const STORATE_VERSION = 0;
 const DEFAULT_STATE: State = {
   version: STORATE_VERSION,
-  code: EXAMPLES.addition,
+  code: EXAMPLES["λ addition"],
   tab: "ast",
 };
 
@@ -2018,7 +2436,7 @@ for (const name of Object.keys(TABS)) {
 }
 
 editor.textContent =
-  state.code.trim().length > 0 ? state.code : EXAMPLES.addition;
+  state.code.trim().length > 0 ? state.code : EXAMPLES["λ addition"];
 loadTab(state.tab);
 
 toggle.addEventListener("click", () => {
