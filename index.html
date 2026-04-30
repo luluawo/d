@@ -7,35 +7,31 @@
     <link rel="icon" href="data:," />
     <script src="https://unpkg.com/typescript@5.9.3/lib/typescript.js"></script>
     <script>
-      function run(tsCode) {
-        const js = ts.transpile(tsCode, {
+      async function load(url) {
+        const source = await fetch(url).then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.text();
+        });
+        const js = ts.transpile(source, {
           module: ts.ModuleKind.CommonJS,
           target: ts.ScriptTarget.ESNext,
           removeComments: true,
           inlineSourceMap: true,
           inlineSources: true,
         });
-        // document.body.textContent = js;
-        new Function("exports", js)({});
+        new Function("require", "exports", js)(() => {}, {});
       }
 
-      document.addEventListener("DOMContentLoaded", () => {
-        const scripts = document
-          .querySelectorAll('script[type="text/typescript"]')
-          .forEach((el) => {
-            if (el.hasAttribute("src")) {
-              fetch(el.src)
-                .then((r) => {
-                  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-                  return r.text();
-                })
-                .then(run);
-            } else {
-              run(el.textContent);
-            }
-          });
+      document.addEventListener("DOMContentLoaded", async () => {
+        const scripts = document.querySelectorAll(
+          'script[type="text/typescript"][src]',
+        );
+        for (const el of scripts) {
+          await load(el.src);
+        }
       });
     </script>
+    <script type="text/typescript" src="global.ts"></script>
     <script type="text/typescript" src="main.ts"></script>
 
     <style>
@@ -50,6 +46,12 @@
 
       canvas {
         display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+
+      pre {
+        margin: 0;
       }
 
       .c,
@@ -73,65 +75,70 @@
         right: 1rem;
         bottom: 1rem;
         background-color: hsla(0, 0%, 100%, 0.5);
-        border-radius: 1rem;
+        border-radius: 0.5rem;
         backdrop-filter: blur(10px);
-        box-shadow: 0 0 1px oklch(0.6 0.0248 264.71);
-        /*border: 1px solid oklch(0.92 0.0148 264.71);*/
-        padding: 1.5em 2rem;
+        border: 1px solid oklch(0.95 0.0148 264.71);
       }
 
-      header,
-      #tabs,
-      #cmds {
+      #panel > header,
+      #panel > header > div {
         gap: 0.62em;
       }
 
-      header {
+      #panel > header {
         flex-shrink: 0;
         justify-content: space-between;
       }
       #tabs {
         flex-wrap: wrap;
+        align-items: center;
       }
-      #tabs > div:hover {
-        color: black;
+      #tabs > .button:hover {
         cursor: pointer;
       }
       #tabs > :not(.active) {
-        color: oklch(0.74 0.0148 264.71);
+        color: oklch(0.7 0.05 264.71);
       }
-      #tabs > .active {
-        color: black;
-        border-radius: 1em;
+      #tabs > .button.active {
+        color: deeppink;
         font-weight: bold;
       }
 
-      #toggle,
+      #close-panel,
       #open-panel {
         cursor: pointer;
-        opacity: 0.5;
+        fill: oklch(0.7 0.05 264.71);
       }
 
-      #toggle:hover,
-      #open-panel:hover {
-        opacity: 1;
+      #panel > #editor,
+      #panel > header,
+      #panel > footer {
+        padding: 1.5rem;
       }
 
-      pre {
+      #editor {
         flex: 1;
         outline: none;
         overflow: auto;
+        margin: 0;
+      }
+
+      #editor,
+      footer {
+        border-top: 1px solid oklch(0.96 0.0148 264.71);
       }
 
       #errors {
         position: absolute;
         bottom: 1rem;
-        color: red;
+        color: deeppink;
         text-align: left;
+        padding: 0.5rem 1.5rem;
+        z-index: 100;
       }
 
       ::highlight(parse-error) {
-        background: red;
+        background: deeppink;
       }
 
       /*::highlight(comment) {
@@ -140,8 +147,59 @@
 
       #open-panel {
         position: absolute;
-        top: 2.5em;
-        right: 3em;
+        top: 2.5rem;
+        right: 2.5rem;
+      }
+
+      #dropdown {
+        font-family: "Google Sans Code", monospace;
+        position: absolute;
+        background: white;
+        border: 1px solid oklch(0.95 0.0148 264.71);
+        padding: 0.5rem 0;
+        zindex: 9;
+        border-radius: 0.5rem;
+      }
+
+      .dropdown-option {
+        padding: 0.5em 1em;
+        cursor: pointer;
+      }
+
+      .dropdown-option:hover {
+        background-color: oklch(0.95 0.0148 264.71);
+      }
+
+      footer {
+        gap: 1rem;
+        max-height: 30vh;
+        overflow: auto;
+      }
+
+      footer > .title {
+        font-weight: bold;
+      }
+
+      .footer-error > .title {
+        color: deeppink;
+      }
+
+      footer:not(.footer-error) > .title {
+        color: dodgerblue;
+      }
+
+      footer > .message {
+        font-size: 12px;
+      }
+
+      .footer-hide {
+        display: none !important;
+      }
+
+      #tabs,
+      footer > .title {
+        user-select: none;
+        -webkit-user-select: none;
       }
     </style>
     <svg style="display: none">
@@ -171,18 +229,21 @@
     </div>
     <canvas></canvas>
     <div id="panel" class="c">
-      <div id="errors"></div>
       <header class="r">
         <div id="tabs" class="r"></div>
-        <div id="cmds" class="r">
-          <div id="toggle">
+        <div class="r">
+          <div id="close-panel">
             <svg width="16" height="16">
               <use href="#arrow-top-right"></use>
             </svg>
           </div>
         </div>
       </header>
-      <pre contenteditable="plaintext-only"></pre>
+      <pre id="editor" contenteditable="plaintext-only"></pre>
+      <footer class="c">
+        <div class="title"></div>
+        <pre class="message"></pre>
+      </footer>
     </div>
   </body>
 </html>
