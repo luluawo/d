@@ -420,11 +420,12 @@ class Lambda {
     return 1;
   }
 
-  static noncommutative(a: Term, b: Term): boolean {
+  static noncommutative(a: Term, b: Term, levelDelta: number): boolean {
     const structural =
       (a.label === "λ" || a.label === "@") &&
       (b.label === "λ" || b.label === "@");
-    const variable = a.label === "#" && b.label === "#" && a === b;
+    const variable =
+      a.label === "#" && b.label === "#" && a === b && levelDelta === 0;
     return structural || variable;
   }
 
@@ -451,15 +452,25 @@ class Lambda {
   static interactions(path: Path<Term>): Interaction[] {
     const out: Interaction[] = path.sequence.map((_) => ({}));
 
-    const stack: Lift[] = [];
+    const stack: (Lift & { level: number })[] = [];
+    let level = 0;
+
     for (const right of Lambda.lifted(path, true)) {
+      if (right.terms[1].label === "@") {
+        level += right.terms[2].label === "0" ? 1 : -1;
+      }
+
       if (right.terms[2]?.label === "0") {
-        stack.push(right);
+        stack.push({ ...right, level });
         continue;
       }
 
       const match = stack.findLastIndex((left) =>
-        Lambda.noncommutative(left.terms[1], right.terms[1]),
+        Lambda.noncommutative(
+          left.terms[1],
+          right.terms[1],
+          left.level - level,
+        ),
       );
       if (match === -1) continue;
 
@@ -1713,17 +1724,17 @@ let app = new App(
         plot.destroy();
       };
     },
-    "*path"(canvas: HTMLCanvasElement, source: string) {
-      const lam = Lambda.parse(source);
-      const paths = lam.paths();
-      app.setFooter("info", `${paths.length} paths`);
-      const plot = new PathPlot(canvas, paths, lam.arities()); //.values().take(200).toArray()
-      plot.render();
-      return () => {
-        plot.destroy();
-      };
-    },
-    path(canvas: HTMLCanvasElement, source: string) {
+    // path(canvas: HTMLCanvasElement, source: string) {
+    //   const lam = Lambda.parse(source);
+    //   const paths = lam.paths();
+    //   app.setFooter("info", `${paths.length} paths`);
+    //   const plot = new PathPlot(canvas, paths, lam.arities());
+    //   plot.render();
+    //   return () => {
+    //     plot.destroy();
+    //   };
+    // },
+    trace(canvas: HTMLCanvasElement, source: string) {
       const lam = Lambda.parse(source);
       let paths = lam.paths();
       const total = paths.length;
