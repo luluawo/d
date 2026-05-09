@@ -1609,7 +1609,7 @@ let app = new App(
     },
     prime(canvas: HTMLCanvasElement, source: string) {
       const lam = Lambda.parse(source);
-      const paths = lam.paths().map(Lambda.interactions).toArray();
+      const paths = lam.paths().take(512).map(Lambda.interactions).toArray();
       const exhaustive = paths.length === 512 ? " (non-exhaustive)" : "";
       app.setFooter("info", `${paths.length} primary paths${exhaustive}`);
       const plot = new PathPlot(canvas, paths, lam.arities());
