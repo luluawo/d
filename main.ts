@@ -1,19 +1,17 @@
 import type { Tuple } from "global.ts";
 
-type Tree<T> = { k: T; v: Tree<T>[] };
 type Path<T> = { sequence: T[]; cyclic: boolean };
 type Token = { text: string; index: number };
 type Term = Partial<Token & { label: string }>;
-type Lift = { index: number; terms: Tuple<Term, 3> };
 type Interaction = { product?: 0 | 1 };
+type Transition = Readonly<Tuple<Term, 3>>;
+type Annotation = { transition: Transition; interaction: Interaction };
 type State = { version: number; source: string; tab: string };
 type CameraEvents = {
   any: (p?: Float32Array) => void;
   pointerdown: (p: Float32Array) => void;
   pointermove: (p: Float32Array) => boolean;
   pointerup: (p: Float32Array) => void;
-  wheel: () => void;
-  resize: () => void;
 };
 
 class Graph<T> {
@@ -27,10 +25,6 @@ class Graph<T> {
 
   get size() {
     return this.adjacency.size;
-  }
-
-  has(k: T): boolean {
-    return this.adjacency.has(k);
   }
 
   vertices(): IteratorObject<T> {
@@ -47,13 +41,8 @@ class Graph<T> {
     return this.adjacency.getOrInsert(k, () => new Set());
   }
 
-  touch(k: T): T {
-    this.successors(k);
-    return k;
-  }
-
   add(k: T, v: Iterable<T> = []): this {
-    let set = this.successors(k);
+    const set = this.successors(k);
     for (const x of v) {
       set.add(x);
       this.successors(x);
@@ -75,142 +64,70 @@ class Graph<T> {
     return this;
   }
 
-  undirected(): this {
-    this.union(this.invert());
-    return this;
-  }
-
   /** map is also a quotient operation when fn is non-injective */
-  map<U>(fn: (k: T) => U, out: Map<T, U> = new Map()): Graph<U> {
-    this.vertices().forEach((k) => out.set(k, fn(k)));
+  map<U>(fn: (k: T) => U): Graph<U> {
+    const binds = new Map<T, U>(this.vertices().map((k) => [k, fn(k)]));
     return new Graph(
-      out.entries().map(([k0, k1]) => [
+      binds.entries().map(([k0, k1]) => [
         k1,
         this.successors(k0)
           .values()
-          .map((x) => out.get(x)!),
+          .map((x) => binds.get(x)!),
       ]),
     );
   }
 
   invert(): Graph<T> {
-    let g = new Graph<T>(this.vertices().map((k) => [k, []]));
+    const g = new Graph<T>(this.vertices().map((k) => [k, []]));
     for (const [a, b] of this.edges()) {
       g.add(b, [a]);
     }
     return g;
   }
 
-  *traverse(
-    seed: T,
-    predicate: (path: T[], next: T) => boolean = (path, next) =>
-      !path.includes(next),
-  ): Generator<T[]> {
-    const stack = [[seed]];
+  undirected(): this {
+    this.union(this.invert());
+    return this;
+  }
+
+  native(): IteratorObject<Node<T>> {
+    const binds = new Map<T, Node<T>>(
+      this.vertices().map((k) => [k, new Node(k)]),
+    );
+    for (const [k, v] of this.adjacency.entries()) {
+      binds.get(k)!.v.push(...v.values().map((k2) => binds.get(k2)!));
+    }
+    return binds.values();
+  }
+}
+
+class Node<T> {
+  constructor(
+    public readonly k: T,
+    public readonly v: Node<T>[] = [],
+  ) {}
+
+  *traverse<S, Y>(
+    step: (state: S, next: T) => { state?: S; yield?: Y },
+    init: S,
+  ): Generator<Y> {
+    const stack: [S, Node<T>][] = [[init, this]];
 
     while (stack.length) {
-      const path = stack.pop()!;
-      yield path;
+      const [state, node] = stack.pop()!;
+      const s = step(state, node.k);
 
-      for (const next of this.adjacency.get(path.at(-1)!) ?? []) {
-        if (predicate(path, next)) {
-          stack.push([...path, next]);
+      if (s.yield !== undefined) yield s.yield;
+      if (s.state !== undefined) {
+        for (let i = node.v.length - 1; i >= 0; i--) {
+          stack.push([s.state, node.v[i]]);
         }
       }
     }
   }
-
-  toString(): string {
-    return this.adjacency
-      .entries()
-      .map(
-        ([k, v]) =>
-          JSON.stringify(k) +
-          " → " +
-          (v.size
-            ? v
-                .values()
-                .map((x) => JSON.stringify(x))
-                .toArray()
-                .join(",")
-            : "∅"),
-      )
-      .toArray()
-      .join("\n");
-  }
-
-  span(seed: T, depth: number = Infinity, path: T[] = [seed]): Tree<T> {
-    const v = this.adjacency.get(seed);
-    return {
-      k: seed,
-      v:
-        depth > 0 && v
-          ? v
-              .values()
-              .filter((x) => !path.includes(x))
-              .map((x) => this.span(x, depth - 1, [...path, x]))
-              .toArray()
-          : [],
-    };
-  }
-
-  filter(predicate: (k: T) => boolean): Graph<T> {
-    const keep = new Set(this.vertices().filter(predicate));
-    return new Graph(
-      this.adjacency
-        .entries()
-        .filter(([k, _]) => keep.has(k))
-        .map(([k, v]) => [k, new Set(v.values().filter((x) => keep.has(x)))]),
-    );
-  }
-
-  contract(
-    predicate: (converge: Tree<T>, diverge: Tree<T>) => boolean,
-    depth: number = 1,
-  ): Graph<T> {
-    // TODO does not support self-loops
-
-    const inv = this.invert();
-    const g = new Graph<T>();
-    const redirect = new Map<T, { contracted: boolean; exits: T[] }>(
-      this.vertices().map((k) => {
-        const co = inv.span(k, depth),
-          di = this.span(k, depth);
-        return [
-          k,
-          !predicate(co, di)
-            ? { contracted: true, exits: di.v.map((t) => t.k) }
-            : { contracted: false, exits: [] },
-        ];
-      }),
-    );
-    const follow = (k: T, seen: Set<T> = new Set()): Iterable<T> => {
-      seen.add(k);
-      const v = redirect.get(k)!;
-      return !v.contracted
-        ? [k]
-        : Iterator.concat(
-            ...v.exits
-              .values()
-              .filter((x) => !seen.has(x))
-              .map((x) => follow(x, seen)),
-          );
-    };
-
-    for (const [k, v] of redirect.entries().filter(([_, v]) => !v.contracted)) {
-      g.add(
-        k,
-        this.successors(k)
-          .values()
-          .flatMap((x) => follow(x)),
-      );
-    }
-
-    return g;
-  }
 }
 
-class Dsl {
+class Lang {
   static parseError<T extends { index?: number }>(
     message: string,
     object: T,
@@ -237,59 +154,23 @@ class Dsl {
   static parenthesis<T>(
     iterable: Iterable<T>,
     delta: (k: T) => -1 | 0 | 1,
-  ): Tree<T>[] {
+  ): Node<T>[] {
     let iterator = Iterator.from(iterable);
     return iterator
       .map((x) => [x, delta(x)] as [T, number])
       .takeWhile(([_, d]) => d >= 0)
-      .map(([x, d]) => ({
-        k: x,
-        v: d > 0 ? Dsl.parenthesis(iterator, delta) : [],
-      }))
+      .map(
+        ([x, d]) => new Node(x, d > 0 ? Lang.parenthesis(iterator, delta) : []),
+      )
       .toArray();
-  }
-
-  static build(root: Tree<Term>): Graph<Term> {
-    let symbols: Map<string, Term> = new Map();
-    let graph = new Graph<Term>();
-    function go(node: Tree<Term>, context?: Term): Term {
-      switch (node.k.text) {
-        case "[":
-          const path = node.v.map((x) => go(x, context));
-          if (path.length > 0) {
-            graph.link(...path);
-            return path[0];
-          } else {
-            return graph.touch({});
-          }
-        case "{":
-          const parent = graph.touch({});
-          graph.add(
-            parent,
-            node.v.map((x) => go(x, parent)),
-          );
-          return parent;
-        case "&":
-          if (context === undefined) {
-            throw new Error("build: no context");
-          }
-          return context;
-        case undefined:
-          throw new Error("build: missing text field");
-        default:
-          return symbols.getOrInsert(node.k.text, () => graph.touch(node.k));
-      }
-    }
-    root.v.forEach((branch) => go(branch));
-    return graph;
   }
 
   static tokenize(
     source: string,
     atoms: RegExp,
-    parenthesis = Dsl.standardParenthesis,
-  ): Tree<Term>[] {
-    return Dsl.parenthesis(
+    parenthesis = Lang.standardParenthesis,
+  ): Node<Term>[] {
+    return Lang.parenthesis(
       source
         .matchAll(atoms)
         .filter((m) => m[0][0] !== "/" || m[0][1] !== "/")
@@ -297,261 +178,288 @@ class Dsl {
       parenthesis,
     );
   }
+}
 
-  static parse(source: string): Graph<Term> {
-    const atoms = /\/\/[^\n]*|[(){}[\]]|[^\s(){}[\]]+/g;
-    return this.build({ k: {} as Term, v: Dsl.tokenize(source, atoms) });
+class Canonical<T> {
+  private readonly ordinals = new Map<T, number>();
+  private readonly collections = new Map<string, readonly T[]>();
+
+  public ordinal(x: T): number {
+    return this.ordinals.getOrInsert(x, () => this.ordinals.size);
+  }
+
+  private cid(v: readonly T[], symmetry: boolean, cyclic: boolean): string {
+    const ids = v.map((x) => this.ordinal(x));
+    const rotateMin = (xs: number[]) => {
+      const minimum = xs.entries().reduce((a, b) => (a[1] < b[1] ? a : b))[0];
+      return xs.rotate(minimum);
+    };
+    const lexicographicLess = (a: number[], b: number[]): boolean => {
+      for (let i = 0; i < Math.min(a.length, b.length); i++) {
+        if (a[i] !== b[i]) return a[i] < b[i];
+      }
+      return a.length < b.length;
+    };
+
+    let m = symmetry ? [ids, ids.toReversed()] : [ids];
+    if (cyclic) m = m.map((w) => rotateMin(w));
+    const w = m.length === 1 || lexicographicLess(m[0], m[1]) ? m[0] : m[1];
+    return w.map((x) => String(x)).join(",");
+  }
+
+  public ensure(
+    v: readonly T[],
+    symmetry: boolean = false,
+    cyclic: boolean = false,
+  ): boolean {
+    const cid = this.cid(v, symmetry, cyclic);
+    if (!this.collections.has(cid)) {
+      this.collections.set(cid, v);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  public collection(
+    v: readonly T[],
+    symmetry: boolean = false,
+    cyclic: boolean = false,
+  ): readonly T[] {
+    return this.collections.getOrInsert(this.cid(v, symmetry, cyclic), () => v);
   }
 }
 
 class Lambda {
-  constructor(public readonly net: Graph<Term>) {}
+  static KIND = {
+    LAM: "λ",
+    APP: "@",
+    VAR: "#",
+    PORT: ":",
+  };
 
-  main(): Term {
-    return this.net
-      .vertices()
-      .find((t) => t.label === "#" && t.text === "main")!;
-  }
+  constructor(public readonly net: Graph<Term>) {}
 
   arities(): Map<Term, number> {
     return new Map<Term, number>(
       this.net
         .vertices()
-        .filter((t) => Lambda.isCombinator(t))
+        .filter((t) => t.label !== Lambda.KIND.PORT)
         .map((t) => [t, Math.max(0, this.net.successors(t).size - 1)]),
     );
   }
 
-  paths(iterations: number = 2 ** 13, primes: boolean = true): Path<Term>[] {
-    // TODO may compute interactions during traversal
+  *paths(): Generator<Path<Transition>> {
+    type Trace = { path: Term[]; transitions: Transition[] };
 
-    const identifiers = new Map<any, number>();
-    const id = (x: any) => identifiers.getOrInsert(x, () => identifiers.size);
-    const canon = (cycle: any[], rotate: boolean): string => {
-      const ids = cycle.map(id);
-      const rotateMin = (xs: number[]) => {
-        const minimum = xs.entries().reduce((a, b) => (a[1] < b[1] ? a : b))[0];
-        return xs.rotate(minimum);
-      };
-      const lexicographicLess = (a: number[], b: number[]): boolean => {
-        for (let i = 0; i < Math.min(a.length, b.length); i++) {
-          if (a[i] !== b[i]) return a[i] < b[i];
-        }
-        return a.length < b.length;
-      };
-      const [forward, backward] = rotate
-        ? [rotateMin(ids), rotateMin(ids.toReversed())]
-        : [ids, ids.toReversed()];
-      return (lexicographicLess(forward, backward) ? forward : backward).join(
-        ",",
+    const NULLARY: Term = {};
+    const canonical = new Canonical<Term>();
+
+    const filter = (path: Term[], c: Term): boolean => {
+      if (path.length <= 1) return true;
+
+      const a = path.at(-2)!;
+      const insideCombinator = Lambda.isPort(a) && Lambda.isPort(c);
+      return (
+        a !== c && (!insideCombinator || (a.text === "0") !== (c.text === "0"))
       );
     };
 
-    const visited = new Set<string>();
-    const paths: Path<Term>[] = [];
-    this.net
-      .traverse(this.main(), (path, next) => {
-        const p = Lambda.categorize([...path, next]);
-        if (p === 0) return false;
-        else if (p === 1) return --iterations > 0;
-        else {
-          const id = canon(p.sequence, p.cyclic);
-          if (!visited.has(id)) {
-            paths.push(p);
-            visited.add(id);
+    yield* this.net
+      .native()
+      .find((n) => n.k.label === "#" && n.k.text === "main")!
+      .traverse<Trace, Path<Transition>>(
+        ({ path, transitions }: Trace, next: Term) => {
+          if (!filter(path, next)) return {};
+
+          const newPath = [...path, next];
+          const prev = path.at(-1);
+          if (path.length >= 1 && path[0] === next) {
+            // TODO may not ignore other erasers out
+
+            return {
+              yield: {
+                sequence: [...transitions, [prev, next, NULLARY] as Transition],
+                cyclic: false,
+              },
+            };
+          } else if (Lambda.isCombinator(prev) && Lambda.isPort(next)) {
+            const trans = canonical.collection([
+              path.at(-2) ?? NULLARY,
+              prev!,
+              next,
+            ]) as Transition;
+
+            const newTransitions = [...transitions, trans];
+            let cycleStart;
+            if (
+              (cycleStart = transitions.findLastIndex((t) => t === trans)) !==
+              -1
+            ) {
+              return {
+                yield: {
+                  sequence: newTransitions.slice(cycleStart + 1),
+                  cyclic: true,
+                },
+              };
+            } else {
+              return { state: { path: newPath, transitions: newTransitions } };
+            }
+          } else {
+            return { state: { path: newPath, transitions } };
           }
-          return !primes && --iterations > 0;
+        },
+        { path: [], transitions: [] },
+      )
+      .filter((path) =>
+        canonical.ensure(
+          path.sequence.flatMap((x) => x),
+          true,
+          path.cyclic,
+        ),
+      );
+  }
+
+  static getContext(transitions: Iterable<Transition>): Term[] {
+    let variable: Term | undefined;
+    const context: Term[] = [];
+    for (const [entry, comb, exit] of transitions) {
+      const inner = context.at(-1)?.label === "@";
+      if (variable === undefined) {
+        if (comb.label !== "#") {
+          throw new Error("unexpected context variable");
         }
-      })
-      .count();
-    return paths;
-  }
-
-  static format(t: Term): string {
-    return t.label! + (t.text ? t.text : "");
-  }
-
-  static isPort(t: Term): boolean {
-    return t?.label !== undefined && /^\d+$/.test(t.label);
-  }
-
-  static isCombinator(t: Term): boolean {
-    return t?.label !== undefined && !Lambda.isPort(t);
-  }
-
-  static categorize(path: readonly Term[]): Path<Term> | 0 | 1 {
-    const isMain = (t: Term): boolean => t?.label === "#" && t.text === "main";
-    const occurrences = (t: Term): number[] =>
-      path
-        .entries()
-        .filter(([_, x]) => x === t)
-        .map(([i, _]) => i)
-        .toArray();
-
-    const a = path.at(-3)!;
-    const c = path.at(-1)!;
-    const combinatorTransition = Lambda.isPort(a) && Lambda.isPort(c);
-
-    if (
-      a === c ||
-      (combinatorTransition && (a.label === "0") === (c.label === "0"))
-    ) {
-      return 0;
-    } else if (combinatorTransition) {
-      const occ = occurrences(c);
-      if (occ.pop() !== path.length - 1) throw new Error("unexpected");
-      const cycle = occ.find((idx) => path[idx - 2] === a);
-
-      if (cycle !== undefined) {
-        return {
-          sequence: path.slice(cycle + 1),
-          cyclic: true,
-        };
+        variable = comb;
+      } else if (comb.label === "@" && Lambda.isPort(entry, 1)) {
+        if (inner) {
+          context.pop();
+        }
+        context.push(comb);
+      } else if (inner && comb.label === "#" && Lambda.isPort(entry, 0)) {
+        context.push(exit);
       }
-    } else if (path.length > 1 && isMain(path[0]) && isMain(c)) {
-      return {
-        sequence: path.slice(),
-        cyclic: false,
-      };
     }
-    return 1;
+    if (context.at(-1)?.label === "@") {
+      context.pop();
+    }
+    return context;
   }
 
-  /**
-   * Path-local noncommutativity test for lambda-encodings.
-   * Assumes non-affinity only arises from shared duplication variables generated by Lambda.build.
-   * Not intended to classify arbitrary interaction-net sharing (yet). */
-  static noncommutative(path: Lift[]): boolean {
-    const a = path[0].terms[1],
-      b = path.at(-1)!.terms[1];
+  static annihilation(path: Transition[]): boolean {
+    const a = path[0][1],
+      b = path.at(-1)![1];
     const structural =
       (a.label === "λ" || a.label === "@") &&
       (b.label === "λ" || b.label === "@");
     const variable = a.label === "#" && b.label === "#" && a === b;
 
-    const range = function* (start: number, end: number): Generator<number> {
-      const step = start <= end ? 1 : -1;
-
-      for (
-        let value = start;
-        step > 0 ? value <= end : value >= end;
-        value += step
-      ) {
-        yield value;
-      }
-    };
-
-    const getContext = (variable: Term, forward: boolean): Term[] => {
-      const n = path.length - 2;
-      const it = (forward ? range(1, n) : range(n, 1))
-        .map((i) => path[i].terms)
-        .filter(
-          (l) => ((l[0].label === "0") === forward) === (l[1].label === "#"),
-        );
-
-      const context: Term[] = [];
-      for (const l of it) {
-        const inner = context.at(-1)?.label === "@";
-        if (!inner && l[1].label === "@") {
-          context.push(l[1]);
-        } else if (inner && l[1].label === "#") {
-          if (l[1] !== variable) {
-            context.push(l[1]);
-            context.push(l[forward ? 2 : 0]);
-          } else {
-            context.pop();
-          }
-        }
-      }
-      if (context.at(-1)?.label === "@") {
-        context.pop();
-      }
-      return context;
-    };
-
     const selfInteraction = () => {
       const arraysEq = <T>(a: T[], b: T[]): boolean =>
         a.length === b.length && a.every((value, i) => value === b[i]);
 
-      return arraysEq(getContext(a, true), getContext(b, false));
+      return arraysEq(
+        Lambda.getContext(
+          Iterator.range(0, path.length - 2).map((i) => path[i]),
+        ),
+        Lambda.getContext(
+          Iterator.range(path.length - 1, 1).map(
+            (i) => path[i].toReversed() as any,
+          ),
+        ),
+      );
     };
 
     return structural || (variable && selfInteraction());
   }
 
-  static lifted(path: Path<Term>, repeat: boolean = false): Generator<Lift> {
+  static interactions(path: Path<Transition>): Path<Annotation> {
+    const annotations: Annotation[] = path.sequence.map((transition) => ({
+      transition,
+      interaction: {},
+    }));
+
     const n = path.sequence.length;
-    if (n === 0) return Iterator.from([]) as any;
+    const limit = n * (path.cyclic ? 2 : 1) - 1;
+    let remit = 0;
+    for (const i of Iterator.range(0, limit)) {
+      const right = annotations[i % n];
 
-    const it = path.cyclic
-      ? Iterator.concat(
-          [path.sequence.at(-1)!],
-          path.sequence,
-          repeat ? path.sequence : [],
-          [path.sequence[0]],
-        )
-      : Iterator.concat([{}], path.sequence, [{}]);
-    return it
-      .windows(3)
-      .map((terms, i) => ({ index: i % n, terms }))
-      .filter(({ terms }) => Lambda.isCombinator(terms[1])) as ReturnType<
-      typeof Lambda.lifted
-    >;
-  }
-
-  static interactions(path: Path<Term>): Interaction[] {
-    const out: Interaction[] = path.sequence.map((_) => ({}));
-
-    const stack: [number, Lift][] = [];
-    const lifted = Lambda.lifted(path, true).toArray();
-
-    for (const [i, right] of lifted.entries()) {
-      if (right.terms[2]?.label === "0") {
-        stack.push([i, right]);
+      if (
+        i === remit ||
+        right.interaction.product !== undefined ||
+        Lambda.isPort(right.transition[2], 0)
+      )
         continue;
-      }
 
-      const match = stack.findLastIndex(([j, _]) =>
-        Lambda.noncommutative(lifted.slice(j, i + 1)),
-      );
-      if (match === -1) continue;
+      const match = Iterator.range(i - 1, remit)
+        .map((j) => [j, annotations[j % n]] as [number, Annotation])
+        .filter(
+          ([_, a]) =>
+            a.interaction.product === undefined &&
+            Lambda.isPort(a.transition[2], 0),
+        )
+        .find(([j, _]) =>
+          Lambda.annihilation(
+            Iterator.range(j, i)
+              .map((k) => annotations[k % n].transition)
+              .toArray(),
+          ),
+        );
+      if (match === undefined) continue;
 
-      const left = stack.splice(match, 1)[0][1];
-      const interaction = {
-        product: Number(left.terms[0].label === right.terms[2].label) as 0 | 1,
+      const left = annotations[match[0] % n];
+      left.interaction = right.interaction = {
+        product: Number(
+          left.transition[0].text === right.transition[2].text,
+        ) as 0 | 1,
       };
-      out[left.index] = out[right.index] = interaction;
-      if (interaction.product === 0) {
-        stack.splice(0, match);
+      if (right.interaction.product === 0) {
+        remit = match[0] + 1;
       }
     }
-    return out;
+    return { sequence: annotations, cyclic: path.cyclic };
   }
 
-  static build(root: Tree<Term>): Lambda {
+  static isPort(term: Term | undefined, n?: number): boolean {
+    return (
+      term !== undefined &&
+      term.label === Lambda.KIND.PORT &&
+      (n === undefined || n === Number(term.text))
+    );
+  }
+
+  static isCombinator(term: Term | undefined): boolean {
+    return term !== undefined && term.label !== Lambda.KIND.PORT;
+  }
+
+  static format(t: Term): string {
+    return t.label + (t.text ?? "");
+  }
+
+  static build(root: Node<Term>): Lambda {
     type Variable = { term: Term; occurrences: number };
     let graph = new Graph<Term>();
-    let definitions = new Map<string, Tree<Term>>();
+    let definitions = new Map<string, Node<Term>>();
 
     function port(n: number): Term {
-      return { label: n.toFixed(0) };
+      return { label: ":", text: n.toFixed(0) };
     }
 
     function ports(length: number): Term[] {
       return Array.from({ length }, (_, i) => port(i));
     }
 
-    function enforceArity(node: Tree<Term>, arity: number): void | never {
+    function enforceArity(node: Node<Term>, arity: number): void {
       if (node.v.length !== arity) {
-        Dsl.parseError(`invalid children length`, node.k);
+        Lang.parseError(`invalid children length`, node.k);
       }
     }
 
     function enforceNamed(
-      node: Tree<Term>,
-    ): asserts node is Tree<Term & { text: string }> {
+      node: Node<Term>,
+    ): asserts node is Node<Term & { text: string }> {
       if (node.k.text === undefined || node.k.text.length === 0) {
-        Dsl.parseError("missing variable name", node.k);
+        Lang.parseError("missing variable name", node.k);
       }
     }
 
@@ -572,24 +480,24 @@ class Lambda {
       return instantiate(definition, [...expansion, name], []);
     }
 
-    function register(node: Tree<Term>) {
+    function register(node: Node<Term>) {
       if (node.k.label !== "=") return;
 
       enforceArity(node, 2);
       enforceNamed(node.v[0]);
       if (node.v[0].k.label !== "#") {
-        Dsl.parseError("invalid LHS", node.v[0].k);
+        Lang.parseError("invalid LHS", node.v[0].k);
       }
       const name = node.v[0].k.text;
       if (definitions.has(name)) {
-        Dsl.parseError("duplicate definition", node.v[0].k);
+        Lang.parseError("duplicate definition", node.v[0].k);
       }
       definitions.set(name, node.v[1]);
     }
 
     // TODO global variables
     function instantiate(
-      node: Tree<Term>,
+      node: Node<Term>,
       expansion: string[] = [],
       variables: Variable[] = [],
     ): Term {
@@ -630,7 +538,7 @@ class Lambda {
             if (expanded !== undefined) {
               return expanded;
             } else {
-              Dsl.parseError(`unknown variable ${node.k.text}`, node.k);
+              Lang.parseError(`unknown variable ${node.k.text}`, node.k);
             }
           }
           const pv = port(v.occurrences++ + 1);
@@ -638,14 +546,14 @@ class Lambda {
           return pv;
         case "=":
           if (variables.length !== 0 || expansion.length !== 0) {
-            Dsl.parseError("unsupported non-root equality", node.k);
+            Lang.parseError("unsupported non-root equality", node.k);
           }
           enforceArity(node, 2);
           enforceNamed(node.v[0]);
           return instantiate(node.v[1], expansion, variables);
         case undefined:
         default:
-          Dsl.parseError("unknown label", node.k);
+          Lang.parseError("unknown label", node.k);
       }
     }
 
@@ -654,7 +562,7 @@ class Lambda {
   }
 
   static parse(source: string): Lambda {
-    function isVariable(node: Tree<Term>): boolean {
+    function isVariable(node: Node<Term>): boolean {
       return (
         node.v.length === 0 &&
         node.k.text !== undefined &&
@@ -663,9 +571,9 @@ class Lambda {
     }
 
     function point(
-      node: Tree<Term>,
-      then: IteratorObject<Tree<Term>>,
-    ): Tree<Term> | undefined {
+      node: Node<Term>,
+      then: IteratorObject<Node<Term>>,
+    ): Node<Term> | undefined {
       switch (node.k.text) {
         case "(":
           return line(node.v.values());
@@ -673,7 +581,7 @@ class Lambda {
         case "\\":
           const body = line(then);
           if (body === undefined) {
-            Dsl.parseError("missing lambda body", node.k);
+            Lang.parseError("missing lambda body", node.k);
           }
           return node.v
             .values()
@@ -681,41 +589,41 @@ class Lambda {
             .map((n) => n.k)
             .toArray()
             .reduceRight(
-              (inner, term) => ({ k: { ...term, label: "λ" }, v: [inner] }),
+              (inner, term) => new Node({ ...term, label: "λ" }, [inner]),
               body,
             );
         case ")":
         case ".":
-          Dsl.parseError("unmatched delimiter", node.k);
+          Lang.parseError("unmatched delimiter", node.k);
         case "\n":
           return undefined;
         case "=":
-          Dsl.parseError("unreachable", node.k);
+          Lang.parseError("unreachable", node.k);
         default:
           if (!isVariable(node)) {
-            Dsl.parseError("expected variable", node.k);
+            Lang.parseError("expected variable", node.k);
           }
-          return { k: { ...node.k, label: "#" }, v: [] };
+          return new Node({ ...node.k, label: "#" });
       }
     }
 
     function line(
-      iterator: IteratorObject<Tree<Term>>,
-    ): Tree<Term> | undefined {
+      iterator: IteratorObject<Node<Term>>,
+    ): Node<Term> | undefined {
       let left = undefined;
       for (let item; !(item = iterator.next()).done; ) {
         let node = item.value;
         if (node.k.text === "=") {
           let right = line(iterator);
           if (left && right) {
-            return { k: { ...node.k, label: "=" }, v: [left, right] };
+            return new Node({ ...node.k, label: "=" }, [left, right]);
           } else {
-            Dsl.parseError("unbalanced equality", node.k);
+            Lang.parseError("unbalanced equality", node.k);
           }
         } else {
           let right = point(node, iterator);
           if (right) {
-            left = left ? { k: { label: "@" }, v: [left, right] } : right;
+            left = left ? new Node({ label: "@" }, [left, right]) : right;
           }
         }
       }
@@ -737,43 +645,14 @@ class Lambda {
     }
 
     const atoms = /\/\/[^\n]*|[()λ\\.=\n]|[^\s()λ\\.=]+/g;
-    const roots: Tree<Term>[] = Dsl.tokenize(source, atoms, parenthesis)
+    const roots: Node<Term>[] = Lang.tokenize(source, atoms, parenthesis)
       .values()
       .split((r) => r.k.text === "\n")
       .map((expression) => line(expression.values()))
       .filter((x) => x !== undefined)
       .toArray();
 
-    return Lambda.build({ k: { label: "root" }, v: roots });
-  }
-}
-
-class Profile {
-  private frames: number = 0;
-  private time: number = Date.now();
-
-  constructor(
-    private readonly maxTimeDelta?: number,
-    private logging: boolean = false,
-  ) {}
-
-  increment() {
-    if (
-      this.maxTimeDelta !== undefined &&
-      Date.now() - this.time > this.maxTimeDelta
-    ) {
-      if (this.logging) {
-        console.log(`Framerate: ${this.framerate.toFixed(2)} i/s`);
-      }
-      this.frames = 0;
-      this.time = Date.now();
-    } else {
-      this.frames += 1;
-    }
-  }
-
-  get framerate() {
-    return (1000 * this.frames) / (Date.now() - this.time);
+    return Lambda.build(new Node({ label: "root" }, roots));
   }
 }
 
@@ -808,10 +687,6 @@ class Camera {
   center() {
     const s = this.middle.slice().mul(this.viewport).array();
     this.context.setTransform(1, 0, 0, 1, ...s);
-  }
-
-  fromWorld(p: Float32Array): Float32Array {
-    return this.context.getTransform().transformPoint(p.DOMPoint()).vec2();
   }
 
   toWorld(p: Float32Array): Float32Array {
@@ -952,7 +827,6 @@ class Camera {
           p[1] * (1 - factor),
         );
         this.events.any?.();
-        this.events.wheel?.();
       },
       { signal: this.controller.signal },
     );
@@ -961,7 +835,6 @@ class Camera {
       () => {
         this.resize();
         this.events.any?.();
-        this.events.resize?.();
       },
       { signal: this.controller.signal },
     );
@@ -978,8 +851,6 @@ abstract class Plot {
   static MAX_PHYSICS_FRAMES = 16;
 
   protected context: CanvasRenderingContext2D;
-  protected session: Profile = new Profile();
-  protected interval: Profile = new Profile(10 * 1000, false);
   private animationId: number | undefined;
   protected tracking: Float32Array[] | undefined;
 
@@ -1002,8 +873,6 @@ abstract class Plot {
   render() {
     this.camera.clear();
     this.draw();
-    this.session.increment();
-    this.interval.increment();
   }
 
   anime() {
@@ -1114,11 +983,6 @@ class GraphPlot extends Plot {
     this.context.font = "16px sans-serif";
     this.context.textAlign = "center";
     this.context.textBaseline = "middle";
-
-    // this.context.fillStyle = "deeppink";
-    // this.context.beginPath();
-    // this.context.arc(0, 0, 2, 0, 2 * Math.PI);
-    // this.context.fill();
 
     this.context.fillStyle = "black";
     for (const a of this.bodies.lines) {
@@ -1240,18 +1104,19 @@ class Doodle {
   }
 
   draw(ctx: CanvasRenderingContext2D, fill: boolean = false) {
-    ctx.setLineDash(this.combinator.label === "#" ? Doodle.DASHED : []);
+    ctx.setLineDash(
+      !fill && this.combinator.label === "#" ? Doodle.DASHED : [],
+    );
     if (this.shape) {
       Doodle.polygon(ctx, this.shape);
     } else {
       ctx.beginPath();
       ctx.arc(this.center[0], this.center[1], this.radius, 0, 2 * Math.PI);
     }
+    ctx.stroke();
     if (fill) {
       ctx.fill();
       ctx.fillStyle = "white";
-    } else {
-      ctx.stroke();
     }
     ctx.fillText(this.text, this.center[0], this.center[1]);
 
@@ -1280,23 +1145,25 @@ class Doodle {
 
   private portIndex(x: number | Term): number {
     if (typeof x !== "number") {
-      x = x.label !== undefined ? Number.parseInt(x.label) : 0;
+      x = x.label === Lambda.KIND.PORT ? Number.parseInt(x.text!) : 0;
     }
     return Math.max(0, Math.min(x, this.ports.length - 1));
   }
 
-  static fromLift(
+  static fromTransition(
     center: Float32Array,
     radius: number,
-    lift: Tuple<Term, 3>,
+    transition: Transition,
     arities: Map<Term, number>,
     axis: number = 0,
   ): Doodle {
-    const combinator = lift[1];
-    if (!Lambda.isCombinator(combinator)) {
-      throw new Error("unexpected");
+    const combinator = transition[1];
+    if (combinator.label === Lambda.KIND.PORT) {
+      throw new Error("unexpected non-combinator");
     }
-    const reverse = lift.at(0)?.label === "0" || lift.at(-1)?.label !== "0";
+    const reverse =
+      Lambda.isPort(transition.at(0), 0) ||
+      !Lambda.isPort(transition.at(-1), 0);
     const doodle = new Doodle(
       center,
       radius,
@@ -1304,8 +1171,8 @@ class Doodle {
       combinator,
       arities.get(combinator) ?? 0,
     );
-    if (lift[0]) doodle.bind(lift[0]);
-    if (lift[2]) doodle.bind(lift[2]);
+    if (transition[0].label !== undefined) doodle.bind(transition[0]);
+    if (transition[2].label !== undefined) doodle.bind(transition[2]);
     return doodle;
   }
 
@@ -1358,45 +1225,45 @@ class PathPlot extends Plot {
   }
 
   private readonly rows: Path<{
-    lift: Tuple<Term, 3>;
+    transition: Transition;
     doodle: Doodle;
     style: { color: string; fill: boolean };
   }>[] = [];
 
   constructor(
     canvas: HTMLCanvasElement,
-    paths: Path<Term>[],
+    paths: Iterable<Path<Annotation>>,
     arities: Map<Term, number>,
   ) {
     super(canvas, new Camera(canvas));
 
-    const interactions = paths.map((path) => Lambda.interactions(path));
-    const styles = new Map<Interaction, { color: string; fill: boolean }>();
-    interactions
-      .values()
-      .flatMap((x) => x)
-      .forEach((i) => {
-        if (i.product !== undefined) {
-          styles.set(i, { color: PathPlot.color(), fill: !i.product });
-        }
-      });
+    const p = Iterator.from(paths).toArray();
 
     const DEFAULT_STYLE = { color: "black", fill: false };
-    this.rows = paths.map((path, row) => ({
-      sequence: Lambda.lifted(path)
-        .map(({ index, terms }, col) => ({
-          style: styles.get(interactions[row][index]) ?? DEFAULT_STYLE,
-          lift: terms,
-          doodle: Doodle.fromLift(
+    const styles = new Map<Interaction, { color: string; fill: boolean }>();
+    const getStyle = (i: Interaction) => {
+      return i.product === undefined
+        ? DEFAULT_STYLE
+        : styles.getOrInsert(i, () => ({
+            color: PathPlot.color(),
+            fill: !i.product,
+          }));
+    };
+    this.rows = Iterator.from(p)
+      .map((path, row) => ({
+        sequence: path.sequence.map(({ transition, interaction }, col) => ({
+          transition,
+          doodle: Doodle.fromTransition(
             PathPlot.grid(col, row),
             PathPlot.RADIUS,
-            terms,
+            transition,
             arities,
           ),
-        }))
-        .toArray(),
-      cyclic: path.cyclic,
-    }));
+          style: getStyle(interaction),
+        })),
+        cyclic: path.cyclic,
+      }))
+      .toArray();
   }
 
   drawLoop(row: (typeof this.rows)[number]) {
@@ -1405,10 +1272,10 @@ class PathPlot extends Plot {
     const a = row.sequence.at(-1)!;
     const b = row.sequence[0];
 
-    if (a.lift[2] === undefined || b.lift[0] === undefined) return;
+    if (a.transition[2] === undefined || b.transition[0] === undefined) return;
 
-    const p = a.doodle.port(a.lift[2]);
-    const q = b.doodle.port(b.lift[0]);
+    const p = a.doodle.port(a.transition[2]);
+    const q = b.doodle.port(b.transition[0]);
 
     const dx = PathPlot.CELL[0] * 0.5;
     const y =
@@ -1424,12 +1291,12 @@ class PathPlot extends Plot {
 
   drawRow(row: (typeof this.rows)[number]) {
     for (const [a, b] of row.sequence.values().windows(2)) {
-      if (a.lift[2] === undefined || b.lift[0] === undefined) {
+      if (a.transition[2] === undefined || b.transition[0] === undefined) {
         throw new Error("unexpected");
       }
 
-      const p = a.doodle.port(a.lift[2]);
-      const q = b.doodle.port(b.lift[0]);
+      const p = a.doodle.port(a.transition[2]);
+      const q = b.doodle.port(b.transition[0]);
 
       this.context.strokeStyle =
         a.style.color === b.style.color ? a.style.color : "black";
@@ -1442,7 +1309,7 @@ class PathPlot extends Plot {
       this.drawLoop(row);
     }
 
-    for (const { lift, doodle, style } of row.sequence) {
+    for (const { doodle, style } of row.sequence) {
       this.context.fillStyle = this.context.strokeStyle = style.color;
       doodle.draw(this.context, style.fill);
     }
@@ -1721,33 +1588,8 @@ let app = new App(
           .toArray(),
       );
     },
-    // normalize() {},
   },
   {
-    // graph(canvas: HTMLCanvasElement, source: string) {
-    //   const labeled = (x: Term) => !!x.text?.match(/^λ|\d+|#\S*$/);
-    //   let g = Dsl.parse(source)
-    //     .undirected()
-    //     .contract((t) => {
-    //       if (labeled(t.k)) {
-    //         for (const x of t.v) {
-    //           x.k.label = t.k.text;
-    //         }
-    //       }
-    //       return true;
-    //     })
-    //     .filter((k) => !labeled(k))
-    //     .contract((t) => t.k.label !== undefined);
-    //   app.setFooter("out", g.toString(), "footer-out");
-    //   const plot = new GraphPlot(
-    //     canvas,
-    //     g.map((k) => ({ label: k.label! })),
-    //   );
-    //   plot.anime();
-    //   return () => {
-    //     plot.destroy();
-    //   };
-    // },
     net(canvas: HTMLCanvasElement, source: string) {
       const lam = Lambda.parse(source);
       app.setFooter(
@@ -1767,27 +1609,9 @@ let app = new App(
     },
     prime(canvas: HTMLCanvasElement, source: string) {
       const lam = Lambda.parse(source);
-      const paths = lam.paths();
-      app.setFooter("info", `${paths.length} primary paths`);
-      const plot = new PathPlot(canvas, paths, lam.arities());
-      plot.render();
-      return () => {
-        plot.destroy();
-      };
-    },
-    const(canvas: HTMLCanvasElement, source: string) {
-      const lam = Lambda.parse(source);
-      let paths = lam
-        .paths()
-        .filter((p) =>
-          Lambda.interactions(p).every(
-            (i) => i.product === undefined || i.product !== 0,
-          ),
-        );
-      app.setFooter(
-        "info",
-        `${paths.length} non-zero paths (0 primary and 0 composite)`,
-      );
+      const paths = lam.paths().map(Lambda.interactions).toArray();
+      const exhaustive = paths.length === 512 ? " (non-exhaustive)" : "";
+      app.setFooter("info", `${paths.length} primary paths${exhaustive}`);
       const plot = new PathPlot(canvas, paths, lam.arities());
       plot.render();
       return () => {

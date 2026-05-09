@@ -16,6 +16,7 @@ declare global {
   }
   interface IteratorConstructor {
     concat<T>(...iterables: Iterable<T>[]): Generator<T>;
+    range(start: number, end: number): Generator<number>;
   }
   interface Iterator<T> {
     takeWhile(predicate: (value: T) => boolean): Generator<T>;
@@ -65,11 +66,24 @@ Map.prototype.getOrInsert = function <K, V>(k: K, create: () => V): V {
   return v;
 };
 
-Iterator.concat = function* <T>(...iterables: Iterable<T>[]): Generator<T> {
-  for (const iterable of iterables) {
-    yield* iterable;
-  }
-};
+Object.assign(Iterator, {
+  *concat<T>(...iterables: Iterable<T>[]): Generator<T> {
+    for (const iterable of iterables) {
+      yield* iterable;
+    }
+  },
+  *range(start: number, end: number): Generator<number> {
+    const step = start <= end ? 1 : -1;
+
+    for (
+      let value = start;
+      step > 0 ? value <= end : value >= end;
+      value += step
+    ) {
+      yield value;
+    }
+  },
+} as typeof Iterator);
 
 Object.assign(Iterator.prototype, {
   *takeWhile<T>(predicate: (value: T) => boolean): Generator<T> {
